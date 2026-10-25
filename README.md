@@ -67,6 +67,30 @@ $ contact-sheet --background black ~/Pictures/2026-10-17
 The example images are scaled down to 150 DPI. The actual output is a 300 DPI A4 page
 (2480×3508 px).
 
+## Installation
+
+Download the archive for your platform from the
+[Releases](https://github.com/msetkowski/contact-sheet/releases) page:
+
+| Platform | Archive |
+|---|---|
+| macOS (Apple silicon) | `contact-sheet-vX.Y.Z-aarch64-apple-darwin.tar.gz` |
+| macOS (Intel) | `contact-sheet-vX.Y.Z-x86_64-apple-darwin.tar.gz` |
+| Linux (x86_64, static) | `contact-sheet-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz` |
+| Windows (x86_64) | `contact-sheet-vX.Y.Z-x86_64-pc-windows-msvc.zip` |
+
+Unpack it and put `contact-sheet` (`contact-sheet.exe` on Windows) somewhere on your `PATH`.
+Each archive has a `.sha256` checksum file next to it.
+
+The macOS binaries are not signed, so Gatekeeper blocks them on first run. To allow
+the downloaded binary to run, remove the quarantine attribute:
+
+```sh
+xattr -d com.apple.quarantine contact-sheet
+```
+
+To build from source instead, see [Building](#building).
+
 ## Usage
 
 ```sh

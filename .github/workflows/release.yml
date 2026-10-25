@@ -1,0 +1,108 @@
+name: Release
+
+# Pushing a version tag (e.g. `git tag v0.1.0 && git push origin v0.1.0`)
+# builds the binaries for all platforms and publishes a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  BIN: contact-sheet
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Statically linked musl binary: runs on any x86_64 Linux distribution,
+          # regardless of its glibc version.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check that the tag matches the Cargo.toml version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [[ "${GITHUB_REF_NAME}" != "v${version}" ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Run tests
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: cargo test --release --locked --target ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          name="${BIN}-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          exe="${BIN}"
+          [[ "${{ runner.os }}" == "Windows" ]] && exe="${BIN}.exe"
+
+          # The binary embeds the DejaVu font, whose license must accompany it.
+          mkdir -p "dist/${name}"
+          cp "target/${{ matrix.target }}/release/${exe}" README.md LICENSE "dist/${name}/"
+          cp assets/LICENSE-DejaVu.txt "dist/${name}/"
+
+          cd dist
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            asset="${name}.zip"
+            7z a -tzip "${asset}" "${name}" > /dev/null
+            sha256sum "${asset}" > "${asset}.sha256"
+          else
+            asset="${name}.tar.gz"
+            tar -czf "${asset}" "${name}"
+            shasum -a 256 "${asset}" > "${asset}.sha256"
+          fi
+          echo "ASSET=dist/${asset}" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            ${{ env.ASSET }}
+            ${{ env.ASSET }}.sha256
+          if-no-files-found: error
+
+  # A single job creates the release once every build has succeeded, so
+  # parallel jobs do not race to create it and no half-finished release is
+  # published when one platform fails.
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
