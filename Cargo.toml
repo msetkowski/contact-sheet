@@ -1,8 +1,8 @@
 [package]
 name = "contact-sheet"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "Create A4 contact sheets from Canon RAW, DNG, TIFF and JPEG photos"
+description = "Create A4 contact sheets from Canon, Nikon and Fujifilm RAW, DNG, TIFF and JPEG photos"
 license = "Apache-2.0"
 repository = "https://github.com/msetkowski/contact-sheet"
 exclude = ["docs/"]

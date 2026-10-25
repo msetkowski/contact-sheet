@@ -36,8 +36,8 @@ glance did not go away. A digital contact sheet does the same job.
 - **Portfolio and teaching.** Show the sequence that led to a final image, as
   photographers have long done with their film contact sheets.
 
-This tool makes such sheets directly from RAW files (Canon CR2/CR3, DNG), TIFF and
-JPEG, without importing them into a photo-management application. It produces
+This tool makes such sheets directly from RAW files (Canon, Nikon, Fujifilm, DNG),
+TIFF and JPEG, without importing them into a photo-management application. It produces
 print-ready A4 pages, or pages with a black background for viewing on screen.
 
 ## Example
@@ -116,12 +116,18 @@ Sheets from a previous run (`contactNN.jpg`) are removed first.
 | Format | Extensions | Decoder |
 |---|---|---|
 | Canon RAW | `.cr2`, `.cr3`, `.crw` | [rawler](https://crates.io/crates/rawler) |
+| Nikon RAW | `.nef`, `.nrw` | rawler |
+| Fujifilm RAW (Bayer and X-Trans sensors) | `.raf` | rawler |
 | DNG | `.dng` | rawler |
 | TIFF (uncompressed, also LZW/Deflate, 8/16 bit) | `.tif`, `.tiff` | [image](https://crates.io/crates/image) |
 | JPEG | `.jpg`, `.jpeg` | image |
 
 For RAW files the embedded JPEG preview is used (fast). If it is missing or
 smaller than the thumbnail, the sensor data is developed by rawler.
+
+Nikon *High Efficiency* NEF files (Z 8, Z 9 and similar) are shown using their embedded
+preview. rawler cannot decode their sensor data yet, so `--verbose` prints `?` instead of
+their pixel dimensions.
 
 ## Building
 

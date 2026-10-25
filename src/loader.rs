@@ -1,4 +1,4 @@
-//! Loading source photos (Canon RAW, DNG, TIFF, JPEG) into a `DynamicImage`.
+//! Loading source photos (Canon, Nikon and Fujifilm RAW, DNG, TIFF, JPEG) into a `DynamicImage`.
 
 use std::path::Path;
 
@@ -12,7 +12,8 @@ use rawler::rawsource::RawSource;
 /// Kind of supported input file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceKind {
-    /// Canon RAW (CR2, CR3, CRW) and DNG – decoded by `rawler`.
+    /// Canon (CR2, CR3, CRW), Nikon (NEF, NRW) and Fujifilm (RAF) RAW, and DNG –
+    /// decoded by `rawler`.
     Raw,
     /// TIFF (including uncompressed, 8/16 bit) and JPEG – decoded by `image`.
     Image,
@@ -22,7 +23,7 @@ pub enum SourceKind {
 pub fn source_kind(path: &Path) -> Option<SourceKind> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     match ext.as_str() {
-        "cr2" | "cr3" | "crw" | "dng" => Some(SourceKind::Raw),
+        "cr2" | "cr3" | "crw" | "nef" | "nrw" | "raf" | "dng" => Some(SourceKind::Raw),
         "tif" | "tiff" | "jpg" | "jpeg" => Some(SourceKind::Image),
         _ => None,
     }
@@ -39,6 +40,9 @@ pub fn format_name(path: &Path) -> &'static str {
         "cr2" => "Canon RAW (CR2)",
         "cr3" => "Canon RAW (CR3)",
         "crw" => "Canon RAW (CRW)",
+        "nef" => "Nikon RAW (NEF)",
+        "nrw" => "Nikon RAW (NRW)",
+        "raf" => "Fujifilm RAW (RAF)",
         "dng" => "DNG",
         "tif" | "tiff" => "TIFF",
         "jpg" | "jpeg" => "JPEG",
@@ -182,6 +186,9 @@ mod tests {
         let kind = |name: &str| source_kind(Path::new(name));
         assert_eq!(kind("IMG_0001.CR2"), Some(SourceKind::Raw));
         assert_eq!(kind("IMG_0001.cr3"), Some(SourceKind::Raw));
+        assert_eq!(kind("DSC_0001.NEF"), Some(SourceKind::Raw));
+        assert_eq!(kind("DSCN0001.nrw"), Some(SourceKind::Raw));
+        assert_eq!(kind("DSCF0001.RAF"), Some(SourceKind::Raw));
         assert_eq!(kind("pano.dng"), Some(SourceKind::Raw));
         assert_eq!(kind("scan.TIF"), Some(SourceKind::Image));
         assert_eq!(kind("photo.jpg"), Some(SourceKind::Image));
