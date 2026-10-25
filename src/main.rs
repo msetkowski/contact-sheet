@@ -18,7 +18,7 @@ const BATCH_ROWS: usize = 8;
 /// Creates A4 contact sheets from the photos in a directory.
 ///
 /// Supported formats: Canon RAW (CR2, CR3, CRW), Nikon RAW (NEF, NRW),
-/// Fujifilm RAW (RAF), DNG, TIFF, JPEG.
+/// Fujifilm RAW (RAF), Hasselblad RAW (3FR, FFF), DNG, TIFF, JPEG.
 /// Output is written to the `contact-sheet` subdirectory as contact01.jpg, contact02.jpg, …
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -83,7 +83,7 @@ fn run(args: Args) -> Result<()> {
     let files = collect_files(&args.input)?;
     if files.is_empty() {
         bail!(
-            "no supported files (CR2, CR3, CRW, NEF, NRW, RAF, DNG, TIFF, JPEG) found in {}",
+            "no supported files (CR2, CR3, CRW, NEF, NRW, RAF, 3FR, FFF, DNG, TIFF, JPEG) found in {}",
             args.input.display()
         );
     }
