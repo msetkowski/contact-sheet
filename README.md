@@ -130,9 +130,10 @@ Nikon *High Efficiency* NEF files (Z 8, Z 9 and similar) are shown using their e
 preview. rawler cannot decode their sensor data yet, so `--verbose` prints `?` instead of
 their pixel dimensions.
 
-Hasselblad files are read for the cameras rawler knows: CFV, CFV-50, H3D, H4D-40, H4D-50,
-H5D-40, H5D-50c, H6D-100cMS, X1D, X1D II 50C and X2D 100C. Files from other models
-(e.g. CFV 100C) are skipped with an "Unknown camera" warning.
+Hasselblad files from cameras rawler does not know (CFV-50c, CFV 100C, 907X and others,
+including CFV backs whose model name carries the body, e.g. "CFV-50c/500") are shown
+using the preview embedded in the file. Their sensor data cannot be decoded, so
+`--verbose` prints `?` instead of their pixel dimensions.
 
 ## Building
 

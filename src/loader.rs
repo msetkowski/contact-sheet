@@ -3,12 +3,15 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use image::metadata::Orientation;
-use image::{DynamicImage, ImageDecoder, ImageReader};
+use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, RgbImage};
 use rawler::decoders::{Decoder, RawDecodeParams};
+use rawler::formats::tiff::GenericTiffReader;
+use rawler::formats::tiff::reader::TiffReader;
 use rawler::imgop::develop::RawDevelop;
 use rawler::rawsource::RawSource;
+use rawler::tags::TiffCommonTag;
 
 /// Kind of supported input file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,7 +147,13 @@ fn load_image(path: &Path) -> Result<DynamicImage> {
 
 fn load_raw(path: &Path, min_size: u32) -> Result<DynamicImage> {
     let src = RawSource::new(path).context("cannot open file")?;
-    let decoder = rawler::get_decoder(&src).map_err(|e| anyhow!("unsupported RAW file: {e}"))?;
+    let decoder = match rawler::get_decoder(&src) {
+        Ok(decoder) => decoder,
+        Err(e) if has_ifd0_preview(path) => {
+            return load_ifd0_preview(&src).map_err(|_| anyhow!("unsupported RAW file: {e}"));
+        }
+        Err(e) => bail!("unsupported RAW file: {e}"),
+    };
     let params = RawDecodeParams::default();
     let orientation = raw_orientation(decoder.as_ref(), &src, &params);
 
@@ -178,6 +187,56 @@ fn load_raw(path: &Path, min_size: u32) -> Result<DynamicImage> {
                 .ok_or_else(|| anyhow!("failed to convert developed image"))?
         }
     };
+    img.apply_orientation(orientation);
+    Ok(img)
+}
+
+/// Whether the format keeps a full-size preview in its first TIFF IFD that can be
+/// read when rawler does not know the camera.
+///
+/// rawler only accepts Hasselblad models listed in its camera database, matched by
+/// the exact model name. CFV backs write the body or shutter mode into that name
+/// (e.g. "Hasselblad CFV-50c/500", "CFV 100C/Electronic Shutter"), so their files
+/// are rejected even though the preview is perfectly readable.
+fn has_ifd0_preview(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(ext.as_str(), "3fr" | "fff")
+}
+
+/// Reads the preview stored in the first IFD: uncompressed 8-bit RGB (older
+/// Hasselblad cameras) or JPEG (X2D, CFV 100C and newer).
+fn load_ifd0_preview(src: &RawSource) -> Result<DynamicImage> {
+    let tiff = GenericTiffReader::new(&mut src.reader(), 0, 0, None, &[])
+        .map_err(|e| anyhow!("cannot read TIFF structure: {e}"))?;
+    let ifd = tiff.root_ifd();
+    let tag = |t: TiffCommonTag| ifd.get_entry(t).map(|e| e.force_usize(0));
+
+    let (strips, _) = ifd
+        .strip_data(src)
+        .map_err(|e| anyhow!("cannot read preview data: {e}"))?;
+    let buf = strips.concat();
+    let mut img = match tag(TiffCommonTag::Compression) {
+        Some(1)
+            if tag(TiffCommonTag::BitsPerSample) == Some(8)
+                && tag(TiffCommonTag::SamplesPerPixel) == Some(3) =>
+        {
+            let width = tag(TiffCommonTag::ImageWidth).context("missing preview width")?;
+            let height = tag(TiffCommonTag::ImageLength).context("missing preview height")?;
+            let rgb = RgbImage::from_raw(width as u32, height as u32, buf)
+                .context("preview data is truncated")?;
+            DynamicImage::ImageRgb8(rgb)
+        }
+        Some(6 | 7) => image::load_from_memory_with_format(&buf, ImageFormat::Jpeg)
+            .context("failed to decode JPEG preview")?,
+        _ => bail!("unsupported preview format"),
+    };
+    let orientation = tag(TiffCommonTag::Orientation)
+        .and_then(|o| Orientation::from_exif(o as u8))
+        .unwrap_or(Orientation::NoTransforms);
     img.apply_orientation(orientation);
     Ok(img)
 }
@@ -235,5 +294,45 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         let img = img.unwrap();
         assert_eq!((img.width(), img.height()), (20, 40));
+    }
+
+    #[test]
+    fn ifd0_rgb_preview_is_read_and_oriented() {
+        // Little-endian TIFF whose first IFD holds a 2×1 uncompressed RGB image
+        // (a red and a blue pixel) with Orientation = 6 (rotate 90° clockwise).
+        let entry = |tag: u16, typ: u16, value: u32| {
+            let mut e = Vec::new();
+            e.extend_from_slice(&tag.to_le_bytes());
+            e.extend_from_slice(&typ.to_le_bytes());
+            e.extend_from_slice(&1u32.to_le_bytes());
+            e.extend_from_slice(&value.to_le_bytes());
+            e
+        };
+        const SHORT: u16 = 3;
+        const LONG: u16 = 4;
+        let entries = [
+            entry(256, SHORT, 2),  // ImageWidth
+            entry(257, SHORT, 1),  // ImageLength
+            entry(258, SHORT, 8),  // BitsPerSample
+            entry(259, SHORT, 1),  // Compression: none
+            entry(262, SHORT, 2),  // PhotometricInterpretation: RGB
+            entry(273, LONG, 122), // StripOffsets: right after the IFD
+            entry(274, SHORT, 6),  // Orientation
+            entry(277, SHORT, 3),  // SamplesPerPixel
+            entry(279, LONG, 6),   // StripByteCounts
+        ];
+        let mut tiff = vec![b'I', b'I', 42, 0, 8, 0, 0, 0];
+        tiff.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        entries.iter().for_each(|e| tiff.extend_from_slice(e));
+        tiff.extend_from_slice(&[0, 0, 0, 0]); // no next IFD
+        assert_eq!(tiff.len(), 122);
+        tiff.extend_from_slice(&[255, 0, 0, 0, 0, 255]);
+
+        let img = load_ifd0_preview(&RawSource::new_from_slice(&tiff))
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(img.dimensions(), (1, 2));
+        assert_eq!(img.get_pixel(0, 0).0, [255, 0, 0]);
+        assert_eq!(img.get_pixel(0, 1).0, [0, 0, 255]);
     }
 }
