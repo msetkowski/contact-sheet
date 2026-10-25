@@ -1,4 +1,5 @@
 mod loader;
+mod pdf;
 mod sheet;
 
 use std::fs;
@@ -9,9 +10,11 @@ use clap::{Parser, ValueEnum};
 use rayon::prelude::*;
 
 use loader::source_kind;
+use pdf::{OutputIntent, PdfSheets};
 use sheet::{Layout, Paginator, Palette, Renderer, Thumb, make_thumbnail};
 
 const OUTPUT_DIR: &str = "contact-sheet";
+const PDF_NAME: &str = "contact.pdf";
 /// Number of rows loaded in parallel in one batch.
 const BATCH_ROWS: usize = 8;
 
@@ -20,6 +23,7 @@ const BATCH_ROWS: usize = 8;
 /// Supported formats: Canon RAW (CR2, CR3, CRW), Nikon RAW (NEF, NRW),
 /// Fujifilm RAW (RAF), Hasselblad RAW (3FR, FFF), DNG, TIFF, JPEG.
 /// Output is written to the `contact-sheet` subdirectory as contact01.jpg, contact02.jpg, …
+/// or, with `--format pdf`, as a single PDF/X-4 file contact.pdf.
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
@@ -34,7 +38,16 @@ struct Args {
     #[arg(short, long, default_value_t = 300, value_parser = clap::value_parser!(u16).range(72..=1200))]
     dpi: u16,
 
-    /// JPEG quality (1–100)
+    /// Output format
+    #[arg(short, long, value_enum, default_value_t = Format::Jpg)]
+    format: Format,
+
+    /// ICC output profile of the printing condition for PDF output, e.g. one from
+    /// your print shop (default: built-in FOGRA39)
+    #[arg(long, value_name = "FILE")]
+    output_profile: Option<PathBuf>,
+
+    /// JPEG quality (1–100), also used for the page images in a PDF
     #[arg(short, long, default_value_t = 90, value_parser = clap::value_parser!(u8).range(1..=100))]
     quality: u8,
 
@@ -46,9 +59,22 @@ struct Args {
     #[arg(short, long, value_enum, default_value_t = Background::White)]
     background: Background,
 
+    /// Show thumbnails only, without file names below them
+    #[arg(long)]
+    no_labels: bool,
+
     /// Print the name, file size, pixel dimensions and format of every file found
     #[arg(short, long)]
     verbose: bool,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum Format {
+    /// One JPEG file per page (contact01.jpg, contact02.jpg, …)
+    Jpg,
+    /// All pages in a single PDF/X-4 file (contact.pdf) with a FOGRA39 output intent,
+    /// or the one given by --output-profile
+    Pdf,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -79,6 +105,12 @@ fn run(args: Args) -> Result<()> {
     if !args.input.is_dir() {
         bail!("{} is not a directory", args.input.display());
     }
+    // Check the profile before the slow part, so a bad file fails right away.
+    let intent = match (&args.output_profile, args.format) {
+        (Some(_), Format::Jpg) => bail!("--output-profile only applies to --format pdf"),
+        (Some(path), Format::Pdf) => OutputIntent::from_icc_file(path)?,
+        (None, _) => OutputIntent::fogra39(),
+    };
 
     let files = collect_files(&args.input)?;
     if files.is_empty() {
@@ -92,7 +124,10 @@ fn run(args: Args) -> Result<()> {
         print_file_list(&files);
     }
 
-    let layout = Layout::a4(args.dpi, args.columns, args.landscape);
+    let mut layout = Layout::a4(args.dpi, args.columns, args.landscape);
+    if args.no_labels {
+        layout = layout.without_labels();
+    }
     if !layout.fits_tallest_row() {
         bail!("with these settings a row of thumbnails does not fit on the page");
     }
@@ -101,18 +136,39 @@ fn run(args: Args) -> Result<()> {
 
     let out_dir = args.input.join(OUTPUT_DIR);
     fs::create_dir_all(&out_dir).with_context(|| format!("cannot create {}", out_dir.display()))?;
-    remove_old_sheets(&out_dir)?;
+    let mut pdf = match args.format {
+        Format::Jpg => {
+            remove_old_sheets(&out_dir)?;
+            None
+        }
+        Format::Pdf => {
+            println!("PDF/X-4 output intent: {}", intent.name());
+            Some(PdfSheets::new(&pdf_title(&args.input), intent))
+        }
+    };
 
     let mut paginator = Paginator::new(layout.clone());
     let mut pending: Vec<Thumb> = Vec::new();
     let mut page_no = 0;
+    let mut photos = 0;
     let mut failed = 0;
     let mut write_page = |rows: Vec<Vec<Thumb>>| -> Result<()> {
         page_no += 1;
-        let path = out_dir.join(format!("contact{page_no:02}.jpg"));
-        renderer.save_jpeg(&renderer.render_page(&rows), &path, args.quality)?;
+        let page = renderer.render_page(&rows);
         let count: usize = rows.iter().map(Vec::len).sum();
-        println!("Saved {} ({count} photo(s))", path.display());
+        photos += count;
+        match &mut pdf {
+            Some(pdf) => {
+                let jpeg = renderer.encode_jpeg(&page, args.quality)?;
+                pdf.add_page(&jpeg, page.width(), page.height(), layout.page_size_pt());
+                println!("Rendered page {page_no} ({count} photo(s))");
+            }
+            None => {
+                let path = out_dir.join(format!("contact{page_no:02}.jpg"));
+                renderer.save_jpeg(&page, &path, args.quality)?;
+                println!("Saved {} ({count} photo(s))", path.display());
+            }
+        }
         Ok(())
     };
 
@@ -157,10 +213,29 @@ fn run(args: Args) -> Result<()> {
     if page_no == 0 {
         bail!("could not load any photo");
     }
+    if let Some(pdf) = pdf {
+        let path = out_dir.join(PDF_NAME);
+        let pages = pdf.page_count();
+        pdf.save(&path)?;
+        println!(
+            "Saved {} ({pages} page(s), {photos} photo(s))",
+            path.display()
+        );
+    }
     if failed > 0 {
         eprintln!("Failed to load {failed} file(s)");
     }
     Ok(())
+}
+
+/// Document title of the PDF, e.g. "Contact sheet – 2026-10-17".
+fn pdf_title(input: &Path) -> String {
+    let dir = input
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| input.display().to_string());
+    format!("Contact sheet – {dir}")
 }
 
 /// Returns supported files from the directory (non-recursive), sorted by name.

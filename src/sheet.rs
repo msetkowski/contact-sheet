@@ -1,7 +1,7 @@
 //! Contact sheet layout and rendering.
 
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use ab_glyph::{FontRef, PxScale};
@@ -80,6 +80,27 @@ impl Layout {
             label_h,
             font_px,
             dpi,
+        }
+    }
+
+    /// Thumbnails only: no file names below them, so rows sit closer together.
+    pub fn without_labels(mut self) -> Self {
+        self.label_h = 0;
+        self
+    }
+
+    fn has_labels(&self) -> bool {
+        self.label_h > 0
+    }
+
+    /// Exact A4 page size in points (1/72 in), unaffected by pixel rounding.
+    pub fn page_size_pt(&self) -> (f32, f32) {
+        let pt = |mm: f32| mm / MM_PER_INCH * 72.0;
+        let (w, h) = (pt(A4_MM.0), pt(A4_MM.1));
+        if self.page_w > self.page_h {
+            (h, w)
+        } else {
+            (w, h)
         }
     }
 
@@ -200,6 +221,9 @@ impl Renderer {
                     self.palette.frame,
                 );
 
+                if !l.has_labels() {
+                    continue;
+                }
                 let label = fit_text(&thumb.label, l.cell, scale, &self.font);
                 let (lw, _) = text_size(scale, &self.font, &label);
                 let lx = x + l.cell.saturating_sub(lw) / 2;
@@ -222,10 +246,22 @@ impl Renderer {
     pub fn save_jpeg(&self, page: &RgbImage, path: &Path, quality: u8) -> Result<()> {
         let file =
             File::create(path).with_context(|| format!("cannot create {}", path.display()))?;
-        let mut enc = JpegEncoder::new_with_quality(BufWriter::new(file), quality);
+        self.write_jpeg(page, BufWriter::new(file), quality)
+            .with_context(|| format!("failed to write {}", path.display()))
+    }
+
+    /// Encodes a page as JPEG into memory (for embedding in a PDF).
+    pub fn encode_jpeg(&self, page: &RgbImage, quality: u8) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        self.write_jpeg(page, &mut buf, quality)
+            .context("failed to encode page")?;
+        Ok(buf)
+    }
+
+    fn write_jpeg(&self, page: &RgbImage, out: impl Write, quality: u8) -> Result<()> {
+        let mut enc = JpegEncoder::new_with_quality(out, quality);
         enc.set_pixel_density(PixelDensity::dpi(self.layout.dpi));
-        enc.encode_image(page)
-            .with_context(|| format!("failed to write {}", path.display()))?;
+        enc.encode_image(page)?;
         Ok(())
     }
 }
@@ -271,6 +307,46 @@ mod tests {
         assert_eq!((l.page_w, l.page_h), (2480, 3508));
         assert!(l.margin + l.columns * l.cell + (l.columns - 1) * l.gap <= l.page_w - l.margin);
         assert!(l.fits_tallest_row());
+    }
+
+    #[test]
+    fn page_without_labels_shows_only_thumbnails() {
+        let l = Layout::a4(150, 5, false).without_labels();
+        let renderer = Renderer::new(l.clone(), Palette::WHITE).unwrap();
+        let mut image = RgbImage::from_pixel(l.cell, l.cell / 2, Rgb([255, 0, 0]));
+        image.put_pixel(0, 0, Rgb([0, 0, 255]));
+        let row = vec![Thumb {
+            image,
+            label: "IMG_0001.CR2".to_string(),
+        }];
+        let page = renderer.render_page(&[row]);
+
+        // Below the thumbnail and its 1 px frame there is only background.
+        let below = l.margin + l.cell / 2 + 1;
+        let x_range = l.margin - 1..l.margin + l.cell + 1;
+        for y in below..below + 2 * l.font_px as u32 {
+            for x in x_range.clone() {
+                assert_eq!(
+                    *page.get_pixel(x, y),
+                    Palette::WHITE.background,
+                    "({x}, {y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rows_without_labels_pack_more_per_page() {
+        let count_rows = |l: Layout| {
+            let mut p = Paginator::new(l.clone());
+            let mut rows = 0;
+            while p.push_row(vec![thumb(l.cell, l.cell)]).is_none() {
+                rows += 1;
+            }
+            rows
+        };
+        let l = Layout::a4(300, 8, false);
+        assert!(count_rows(l.clone().without_labels()) > count_rows(l));
     }
 
     #[test]

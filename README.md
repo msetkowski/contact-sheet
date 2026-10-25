@@ -93,12 +93,14 @@ To build from source instead, see [Building](#building).
 ## Usage
 
 ```sh
-contact-sheet <DIRECTORY> [--columns 5] [--dpi 300] [--quality 90] [--landscape] [--background white|black] [--verbose]
+contact-sheet <DIRECTORY> [--columns 5] [--dpi 300] [--format jpg|pdf] [--output-profile FILE.icc] [--quality 90] [--landscape] [--background white|black] [--no-labels] [--verbose]
 ```
 
 The program scans the given directory (non-recursively) and writes the sheets
 `contact01.jpg`, `contact02.jpg`, … to the `<DIRECTORY>/contact-sheet` subdirectory.
 Sheets from a previous run (`contactNN.jpg`) are removed first.
+With `--format pdf` all pages go into a single file, `contact.pdf`, instead
+(see [PDF output](#pdf-output)).
 
 - A4 page size (300 DPI by default → 2480×3508 px, density stored in the JPEG),
 - 5 columns of thumbnails, each with the source file name below it (long names are shortened in the middle),
@@ -107,8 +109,40 @@ Sheets from a previous run (`contactNN.jpg`) are removed first.
   does not fit entirely on the page, a new file is started,
 - background colour: `white` (default, for printing) or `black` (for on-screen viewing,
   with white labels),
+- `--no-labels` leaves out the file names, so the sheet shows thumbnails only (rows
+  move closer together, so more of them fit on a page),
 - `--verbose` prints the name, file size, pixel dimensions and format of every file found,
 - files that cannot be read are skipped with a warning.
+
+### PDF output
+
+`--format pdf` writes one multi-page PDF file intended for print workflows. It follows
+the PDF/X-4 standard (ISO 15930-7):
+
+- each page is exactly A4 (MediaBox and TrimBox), holding the rendered sheet as a JPEG
+  image at the chosen `--dpi` and `--quality`,
+- the images are tagged with an embedded sRGB ICC profile, so they are colour-managed
+  rather than device RGB,
+- the output intent is **FOGRA39** (ISO Coated v2, offset printing on coated paper), the
+  usual print condition in Europe, unless you choose another one (see below); the
+  profile is embedded in the file,
+- the document carries the metadata PDF/X requires (title, dates, XMP, trapping status).
+
+The images stay in RGB; conversion to CMYK is left to the print shop's RIP, which is
+normal practice for PDF/X-4. An existing `contact.pdf` is overwritten, and JPEG sheets
+from earlier runs are left in place.
+
+To prepare the PDF for a different printing condition, pass the ICC profile your print
+shop asks for, e.g. FOGRA51 (PSO Coated v3) or an uncoated-paper profile:
+
+```sh
+contact-sheet --format pdf --output-profile PSOcoated_v3.icc ~/Pictures/2026-10-17
+```
+
+The profile is checked before any photo is loaded. PDF/X requires an *output* (printer)
+profile in CMYK, RGB or Gray, ICC version 2 or 4; display profiles such as sRGB or
+Adobe RGB are rejected. The profile's description (e.g. "PSO Coated v3") is recorded
+as the output condition.
 
 ## Supported formats
 
@@ -152,3 +186,8 @@ The embedded font `assets/DejaVuSans.ttf` comes from the
 [DejaVu Fonts](https://dejavu-fonts.github.io/) project and is distributed under its own
 license (Bitstream Vera / Arev, DejaVu changes in the public domain); see
 [`assets/LICENSE-DejaVu.txt`](assets/LICENSE-DejaVu.txt).
+
+The ICC profiles embedded in PDF output are in the public domain (CC0):
+`assets/sRGB-v2-magic.icc` from [Compact ICC Profiles](https://github.com/saucecontrol/Compact-ICC-Profiles)
+and `assets/FOGRA39L_coated.icc` from [colord](https://github.com/hughsie/colord)
+(generated with ArgyllCMS from the FOGRA39 characterization data).
