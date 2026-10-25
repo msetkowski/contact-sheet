@@ -75,7 +75,6 @@ Download the archive for your platform from the
 | Platform | Archive |
 |---|---|
 | macOS (Apple silicon) | `contact-sheet-vX.Y.Z-aarch64-apple-darwin.tar.gz` |
-| macOS (Intel) | `contact-sheet-vX.Y.Z-x86_64-apple-darwin.tar.gz` |
 | Linux (x86_64, static) | `contact-sheet-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz` |
 | Windows (x86_64) | `contact-sheet-vX.Y.Z-x86_64-pc-windows-msvc.zip` |
 
