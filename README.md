@@ -38,7 +38,7 @@ glance did not go away. A digital contact sheet does the same job.
 
 This tool makes such sheets directly from RAW files (Canon, Nikon, Fujifilm, Hasselblad,
 DNG), TIFF and JPEG, without importing them into a photo-management application. It produces
-print-ready A4 pages, or pages with a black background for viewing on screen.
+print-ready A4, A3 or Letter pages, or pages with a black background for viewing on screen.
 
 ## Example
 
@@ -76,6 +76,7 @@ Download the archive for your platform from the
 |---|---|
 | macOS (Apple silicon) | `contact-sheet-vX.Y.Z-aarch64-apple-darwin.tar.gz` |
 | Linux (x86_64, static) | `contact-sheet-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz` |
+| Linux (ARM64, static) | `contact-sheet-vX.Y.Z-aarch64-unknown-linux-musl.tar.gz` |
 | Windows (x86_64) | `contact-sheet-vX.Y.Z-x86_64-pc-windows-msvc.zip` |
 
 Unpack it and put `contact-sheet` (`contact-sheet.exe` on Windows) somewhere on your `PATH`.
@@ -93,18 +94,30 @@ To build from source instead, see [Building](#building).
 ## Usage
 
 ```sh
-contact-sheet <DIRECTORY> [--columns 5] [--dpi 300] [--format jpg|pdf] [--output-profile FILE.icc] [--quality 90] [--landscape] [--background white|black] [--no-labels] [--verbose]
+contact-sheet <DIRECTORY> [--recursive [DEPTH]] [--only FORMAT,…] [--paper a4|a3|letter] [--columns 5] [--dpi 300] [--format jpg|pdf] [--output-profile FILE.icc] [--max-pdf-size 500] [--max-pages N] [--quality 90] [--landscape] [--background white|black] [--no-labels] [--verbose]
 ```
 
-The program scans the given directory (non-recursively) and writes the sheets
+The program scans the given directory and writes the sheets
 `contact01.jpg`, `contact02.jpg`, … to the `<DIRECTORY>/contact-sheet` subdirectory.
 Sheets from a previous run (`contactNN.jpg`) are removed first.
-With `--format pdf` all pages go into a single file, `contact.pdf`, instead
-(see [PDF output](#pdf-output)).
+With `--format pdf` all pages go into a single file, `contact.pdf`, instead, or into
+several files when the output is very large (see [PDF output](#pdf-output)).
 
-- A4 page size (300 DPI by default → 2480×3508 px, density stored in the JPEG),
-- 5 columns of thumbnails, each with the source file name below it (long names are shortened in the middle),
-- photos are sorted by name, and the EXIF orientation is applied,
+- only the given directory is scanned by default; `--recursive` also scans all of its
+  subdirectories, and `--recursive 2` goes at most two levels down. Hidden directories
+  and `contact-sheet` output directories from earlier runs are skipped,
+- `--only` limits the sheet to some formats – handy when the camera saves RAW + JPEG
+  and every photo should appear once: `--only raw` (all RAW formats and DNG),
+  `--only jpg` (`.jpg` and `.jpeg`), `--only tif`, or single RAW extensions such as
+  `--only cr3`. Several formats can be listed (`--only cr3,dng`) and case does not
+  matter. The program reports how many files the filter left out,
+- paper size: `a4` (default), `a3` or `letter` (`--paper A3` works too),
+- 300 DPI by default (2480×3508 px on A4, density stored in the JPEG), at most 600 DPI,
+- 5 columns of thumbnails, each with the source file name below it (long names are
+  shortened in the middle); with `--recursive` the label is the path relative to the
+  scanned directory, e.g. `2026-10-17/IMG_0001.CR2`,
+- photos are sorted by name (by relative path with `--recursive`), and the EXIF
+  orientation is applied,
 - row height adapts to the tallest thumbnail in the row; when the next row
   does not fit entirely on the page, a new file is started,
 - background colour: `white` (default, for printing) or `black` (for on-screen viewing,
@@ -119,7 +132,7 @@ With `--format pdf` all pages go into a single file, `contact.pdf`, instead
 `--format pdf` writes one multi-page PDF file intended for print workflows. It follows
 the PDF/X-4 standard (ISO 15930-7):
 
-- each page is exactly A4 (MediaBox and TrimBox), holding the rendered sheet as a JPEG
+- each page has the exact paper size (MediaBox and TrimBox), holding the rendered sheet as a JPEG
   image at the chosen `--dpi` and `--quality`,
 - the images are tagged with an embedded sRGB ICC profile, so they are colour-managed
   rather than device RGB,
@@ -129,8 +142,29 @@ the PDF/X-4 standard (ISO 15930-7):
 - the document carries the metadata PDF/X requires (title, dates, XMP, trapping status).
 
 The images stay in RGB; conversion to CMYK is left to the print shop's RIP, which is
-normal practice for PDF/X-4. An existing `contact.pdf` is overwritten, and JPEG sheets
-from earlier runs are left in place.
+normal practice for PDF/X-4.
+
+#### Large output
+
+Pages are written to disk as soon as they are rendered, so memory use stays the same
+whether the PDF has 10 pages or 10,000 – useful with `--recursive` over a whole archive.
+
+Very large PDFs open slowly or not at all in many viewers and print shop systems, so
+the output is split into several files rather than producing one unusable file:
+
+- `--max-pdf-size MB` – largest size of one file, **500 MB** by default,
+- `--max-pages N` – largest number of pages in one file (no limit by default).
+
+A single file is named `contact.pdf`; split output is named `contact-01.pdf`,
+`contact-02.pdf`, … and the document titles say which part each file is. After the
+first page the program estimates the total size and tells you when the output will be
+split; it also warns if you allow files over 1 GB.
+
+Files are written under temporary names and renamed only when all of them are
+complete. PDF output from an earlier run (`contact.pdf`, `contact-NN.pdf`) is replaced
+only then, so an interrupted run never leaves a broken PDF behind: the previous output
+stays intact, and a leftover hidden `.contact-NN.pdf.part` file is removed by the next
+run. JPEG sheets from earlier runs are left in place.
 
 To prepare the PDF for a different printing condition, pass the ICC profile your print
 shop asks for, e.g. FOGRA51 (PSO Coated v3) or an uncoated-paper profile:

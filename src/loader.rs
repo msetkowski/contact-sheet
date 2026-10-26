@@ -23,25 +23,51 @@ pub enum SourceKind {
     Image,
 }
 
+/// Extensions of the RAW formats (and DNG), lowercase.
+const RAW_EXTENSIONS: &[&str] = &[
+    "cr2", "cr3", "crw", "nef", "nrw", "raf", "3fr", "fff", "dng",
+];
+const JPEG_EXTENSIONS: &[&str] = &["jpg", "jpeg"];
+const TIFF_EXTENSIONS: &[&str] = &["tif", "tiff"];
+
+/// Values accepted by `--only`, for help and error messages.
+pub const FORMAT_FILTERS: &str = "raw, cr2, cr3, crw, nef, nrw, raf, 3fr, fff, dng, jpg, tif";
+
 /// Detects the file kind from its extension (case-insensitive).
 pub fn source_kind(path: &Path) -> Option<SourceKind> {
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    match ext.as_str() {
-        "cr2" | "cr3" | "crw" | "nef" | "nrw" | "raf" | "3fr" | "fff" | "dng" => {
-            Some(SourceKind::Raw)
-        }
-        "tif" | "tiff" | "jpg" | "jpeg" => Some(SourceKind::Image),
-        _ => None,
+    let ext = lowercase_extension(path)?;
+    if RAW_EXTENSIONS.contains(&ext.as_str()) {
+        Some(SourceKind::Raw)
+    } else if JPEG_EXTENSIONS.contains(&ext.as_str()) || TIFF_EXTENSIONS.contains(&ext.as_str()) {
+        Some(SourceKind::Image)
+    } else {
+        None
+    }
+}
+
+pub fn lowercase_extension(path: &Path) -> Option<String> {
+    Some(path.extension()?.to_str()?.to_ascii_lowercase())
+}
+
+/// The extensions a `--only` value stands for (case-insensitive): `raw` for
+/// every RAW format including DNG, `jpg`/`jpeg` and `tif`/`tiff` for both
+/// spellings, or a single RAW extension such as `cr3`.
+pub fn format_filter(name: &str) -> Option<&'static [&'static str]> {
+    let name = name.trim().trim_start_matches('.').to_ascii_lowercase();
+    match name.as_str() {
+        "raw" => Some(RAW_EXTENSIONS),
+        "jpg" | "jpeg" => Some(JPEG_EXTENSIONS),
+        "tif" | "tiff" => Some(TIFF_EXTENSIONS),
+        ext => RAW_EXTENSIONS
+            .iter()
+            .position(|&raw| raw == ext)
+            .map(|i| &RAW_EXTENSIONS[i..=i]),
     }
 }
 
 /// Human-readable format name of a supported file, based on its extension.
 pub fn format_name(path: &Path) -> &'static str {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let ext = lowercase_extension(path).unwrap_or_default();
     match ext.as_str() {
         "cr2" => "Canon RAW (CR2)",
         "cr3" => "Canon RAW (CR3)",
@@ -199,12 +225,7 @@ fn load_raw(path: &Path, min_size: u32) -> Result<DynamicImage> {
 /// (e.g. "Hasselblad CFV-50c/500", "CFV 100C/Electronic Shutter"), so their files
 /// are rejected even though the preview is perfectly readable.
 fn has_ifd0_preview(path: &Path) -> bool {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    matches!(ext.as_str(), "3fr" | "fff")
+    matches!(lowercase_extension(path).as_deref(), Some("3fr" | "fff"))
 }
 
 /// Reads the preview stored in the first IFD: uncompressed 8-bit RGB (older
@@ -244,6 +265,21 @@ fn load_ifd0_preview(src: &RawSource) -> Result<DynamicImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_filters_expand_to_extensions() {
+        assert_eq!(format_filter("RAW"), Some(RAW_EXTENSIONS));
+        assert_eq!(format_filter("cr3"), Some(&["cr3"][..]));
+        assert_eq!(format_filter(".NEF"), Some(&["nef"][..]));
+        assert_eq!(format_filter("jpeg"), Some(&["jpg", "jpeg"][..]));
+        assert_eq!(format_filter("TIF"), Some(&["tif", "tiff"][..]));
+        assert_eq!(format_filter("png"), None);
+        assert_eq!(format_filter(""), None);
+        // Every value listed in the help text is accepted.
+        for name in FORMAT_FILTERS.split(", ") {
+            assert!(format_filter(name).is_some(), "{name}");
+        }
+    }
 
     #[test]
     fn detects_kind_by_extension() {

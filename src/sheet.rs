@@ -38,9 +38,31 @@ impl Palette {
     };
 }
 
-/// A4 dimensions in millimetres.
-const A4_MM: (f32, f32) = (210.0, 297.0);
 const MM_PER_INCH: f32 = 25.4;
+const POINTS_PER_INCH: f32 = 72.0;
+
+/// Paper size in millimetres, portrait (width < height).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Paper {
+    pub width_mm: f32,
+    pub height_mm: f32,
+}
+
+impl Paper {
+    pub const A4: Self = Self {
+        width_mm: 210.0,
+        height_mm: 297.0,
+    };
+    pub const A3: Self = Self {
+        width_mm: 297.0,
+        height_mm: 420.0,
+    };
+    /// US Letter, 8.5 × 11 in.
+    pub const LETTER: Self = Self {
+        width_mm: 215.9,
+        height_mm: 279.4,
+    };
+}
 
 /// Sheet geometry in pixels.
 #[derive(Debug, Clone)]
@@ -55,14 +77,19 @@ pub struct Layout {
     pub label_h: u32,
     pub font_px: f32,
     pub dpi: u16,
+    /// Exact page size in points (1/72 in), unaffected by pixel rounding.
+    pub page_size_pt: (f32, f32),
 }
 
 impl Layout {
-    pub fn a4(dpi: u16, columns: u32, landscape: bool) -> Self {
+    pub fn new(paper: Paper, dpi: u16, columns: u32, landscape: bool) -> Self {
         let mm = |v: f32| (v / MM_PER_INCH * dpi as f32).round() as u32;
-        let (mut page_w, mut page_h) = (mm(A4_MM.0), mm(A4_MM.1));
+        let pt = |v: f32| v / MM_PER_INCH * POINTS_PER_INCH;
+        let (mut page_w, mut page_h) = (mm(paper.width_mm), mm(paper.height_mm));
+        let mut page_size_pt = (pt(paper.width_mm), pt(paper.height_mm));
         if landscape {
             std::mem::swap(&mut page_w, &mut page_h);
+            page_size_pt = (page_size_pt.1, page_size_pt.0);
         }
         let margin = mm(10.0);
         let gap = mm(3.0);
@@ -80,6 +107,7 @@ impl Layout {
             label_h,
             font_px,
             dpi,
+            page_size_pt,
         }
     }
 
@@ -91,17 +119,6 @@ impl Layout {
 
     fn has_labels(&self) -> bool {
         self.label_h > 0
-    }
-
-    /// Exact A4 page size in points (1/72 in), unaffected by pixel rounding.
-    pub fn page_size_pt(&self) -> (f32, f32) {
-        let pt = |mm: f32| mm / MM_PER_INCH * 72.0;
-        let (w, h) = (pt(A4_MM.0), pt(A4_MM.1));
-        if self.page_w > self.page_h {
-            (h, w)
-        } else {
-            (w, h)
-        }
     }
 
     /// Height available for rows (page minus margins).
@@ -303,15 +320,32 @@ mod tests {
 
     #[test]
     fn a4_at_300_dpi() {
-        let l = Layout::a4(300, 5, false);
+        let l = Layout::new(Paper::A4, 300, 5, false);
         assert_eq!((l.page_w, l.page_h), (2480, 3508));
         assert!(l.margin + l.columns * l.cell + (l.columns - 1) * l.gap <= l.page_w - l.margin);
         assert!(l.fits_tallest_row());
     }
 
     #[test]
+    fn a3_and_letter_sizes() {
+        let a3 = Layout::new(Paper::A3, 300, 5, false);
+        assert_eq!((a3.page_w, a3.page_h), (3508, 4961));
+        let letter = Layout::new(Paper::LETTER, 300, 5, false);
+        assert_eq!((letter.page_w, letter.page_h), (2550, 3300));
+        let (w, h) = letter.page_size_pt;
+        assert!((w - 612.0).abs() < 0.01 && (h - 792.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn landscape_swaps_pixels_and_points() {
+        let l = Layout::new(Paper::A3, 150, 5, true);
+        assert!(l.page_w > l.page_h);
+        assert!(l.page_size_pt.0 > l.page_size_pt.1);
+    }
+
+    #[test]
     fn page_without_labels_shows_only_thumbnails() {
-        let l = Layout::a4(150, 5, false).without_labels();
+        let l = Layout::new(Paper::A4, 150, 5, false).without_labels();
         let renderer = Renderer::new(l.clone(), Palette::WHITE).unwrap();
         let mut image = RgbImage::from_pixel(l.cell, l.cell / 2, Rgb([255, 0, 0]));
         image.put_pixel(0, 0, Rgb([0, 0, 255]));
@@ -345,13 +379,13 @@ mod tests {
             }
             rows
         };
-        let l = Layout::a4(300, 8, false);
+        let l = Layout::new(Paper::A4, 300, 8, false);
         assert!(count_rows(l.clone().without_labels()) > count_rows(l));
     }
 
     #[test]
     fn row_that_does_not_fit_starts_new_page() {
-        let l = Layout::a4(300, 5, false);
+        let l = Layout::new(Paper::A4, 300, 5, false);
         let row_h = l.cell + l.label_h;
         let fitting = ((l.content_h() + l.gap) / (row_h + l.gap)) as usize;
         let mut p = Paginator::new(l.clone());
@@ -367,7 +401,7 @@ mod tests {
 
     #[test]
     fn low_rows_pack_more_per_page() {
-        let l = Layout::a4(300, 5, false);
+        let l = Layout::new(Paper::A4, 300, 5, false);
         let mut p = Paginator::new(l.clone());
         let mut rows = 0;
         while p.push_row(vec![thumb(l.cell, l.cell / 3)]).is_none() {

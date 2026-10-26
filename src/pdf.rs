@@ -1,4 +1,4 @@
-//! Writing contact sheets into a single PDF/X-4 file.
+//! Writing contact sheets into PDF/X-4 files.
 //!
 //! Every page is the rendered sheet embedded as one JPEG image covering the
 //! whole page. The image is tagged with an sRGB ICC profile and the document
@@ -6,14 +6,17 @@
 //! their own ICC profile – so a print workflow knows how to convert it.
 
 use std::borrow::Cow;
-use std::fs;
+use std::fs::{self, File};
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::path::Path;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
 use pdf_writer::types::{OutputIntentSubtype, TrappingStatus};
-use pdf_writer::{Content, Date, Filter, Finish, Name, Pdf, Rect, Ref, TextStr};
+use pdf_writer::writers::{Catalog, DocumentInfo};
+use pdf_writer::{Chunk, Content, Date, Filter, Finish, Name, Rect, Ref, Str, TextStr};
 
 /// sRGB IEC 61966-2.1 (ICC v2, Compact ICC Profiles, CC0).
 const SRGB_ICC: &[u8] = include_bytes!("../assets/sRGB-v2-magic.icc");
@@ -180,44 +183,213 @@ fn be32(data: &[u8], at: usize) -> Option<usize> {
     Some(u32::from_be_bytes(bytes.try_into().ok()?) as usize)
 }
 
-/// Builds a multi-page PDF/X-4 document in memory, one sheet at a time.
-pub struct PdfSheets {
-    pdf: Pdf,
+/// Default size limit of a single PDF file; larger output is split into several files.
+pub const DEFAULT_MAX_PDF_BYTES: u64 = 500_000_000;
+
+/// Writes contact sheets into one or more PDF/X-4 files in a directory.
+///
+/// Pages are streamed to disk as they are rendered, so memory use does not
+/// grow with the number of pages. A new file is started when the current one
+/// would grow beyond `max_bytes` or already holds `max_pages` pages – several
+/// usable files are better than one that viewers and RIPs cannot open.
+///
+/// Files are written under temporary names and renamed only once all of them
+/// are complete: `contact.pdf` for a single file, otherwise `contact-01.pdf`,
+/// `contact-02.pdf`, … An interrupted run leaves no partial PDF behind.
+pub struct PdfSeries {
+    dir: PathBuf,
+    title: String,
+    intent: Rc<OutputIntent>,
+    max_pages: Option<usize>,
+    max_bytes: u64,
+    current: Option<PdfFile>,
+    /// Completed files still under their temporary names, with their page counts.
+    finished: Vec<(PathBuf, usize)>,
+}
+
+impl PdfSeries {
+    pub fn new(
+        dir: &Path,
+        title: &str,
+        intent: OutputIntent,
+        max_pages: Option<usize>,
+        max_bytes: u64,
+    ) -> Result<Self> {
+        remove_files_matching(dir, is_temp_name)?;
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            title: title.to_string(),
+            intent: Rc::new(intent),
+            max_pages,
+            max_bytes,
+            current: None,
+            finished: Vec::new(),
+        })
+    }
+
+    /// Adds a page of `size` (width, height in points) covered by `jpeg`, a
+    /// baseline RGB JPEG of `width`×`height` px.
+    pub fn add_page(
+        &mut self,
+        jpeg: &[u8],
+        width: u32,
+        height: u32,
+        size: (f32, f32),
+    ) -> Result<()> {
+        if let Some(file) = &self.current {
+            let full = self.max_pages.is_some_and(|max| file.page_count() >= max)
+                || file.projected_size() + jpeg.len() as u64 > self.max_bytes;
+            if full {
+                self.close_current(true)?;
+            }
+        }
+        let file = match &mut self.current {
+            Some(file) => file,
+            None => {
+                let part = self.finished.len() + 1;
+                let path = self.dir.join(format!(".contact-{part:02}.pdf.part"));
+                self.current
+                    .insert(PdfFile::create(path, Rc::clone(&self.intent))?)
+            }
+        };
+        file.add_page(jpeg, width, height, size)
+    }
+
+    /// Completes the open file. `split` tells whether the output has more than
+    /// one file, which is then noted in the document title.
+    fn close_current(&mut self, split: bool) -> Result<()> {
+        let Some(mut file) = self.current.take() else {
+            return Ok(());
+        };
+        let part = self.finished.len() + 1;
+        let title = if split {
+            format!("{}, part {part}", self.title)
+        } else {
+            self.title.clone()
+        };
+        file.close(&title)?;
+        self.finished.push((file.path.clone(), file.page_count()));
+        Ok(())
+    }
+
+    /// Completes the last file, replaces PDFs of an earlier run and gives the
+    /// files their final names. Returns each file's path and page count.
+    pub fn finish(mut self) -> Result<Vec<(PathBuf, usize)>> {
+        let split = !self.finished.is_empty();
+        self.close_current(split)?;
+        let parts = std::mem::take(&mut self.finished);
+        remove_files_matching(&self.dir, is_output_name)?;
+
+        let mut saved = Vec::with_capacity(parts.len());
+        let count = parts.len();
+        for (i, (temp, pages)) in parts.iter().enumerate() {
+            let name = if count == 1 {
+                "contact.pdf".to_string()
+            } else {
+                format!("contact-{:02}.pdf", i + 1)
+            };
+            let path = self.dir.join(name);
+            fs::rename(temp, &path).with_context(|| {
+                format!("cannot rename {} to {}", temp.display(), path.display())
+            })?;
+            saved.push((path, *pages));
+        }
+        Ok(saved)
+    }
+}
+
+impl Drop for PdfSeries {
+    /// Removes completed files of a run that failed before `finish`.
+    fn drop(&mut self) {
+        for (temp, _) in &self.finished {
+            let _ = fs::remove_file(temp);
+        }
+    }
+}
+
+/// `contact.pdf` or `contact-NN.pdf`: output of an earlier run.
+fn is_output_name(name: &str) -> bool {
+    name == "contact.pdf"
+        || name
+            .strip_prefix("contact-")
+            .and_then(|r| r.strip_suffix(".pdf"))
+            .is_some_and(is_part_number)
+}
+
+/// `.contact-NN.pdf.part`: a file being written, possibly left by a killed run.
+fn is_temp_name(name: &str) -> bool {
+    name.strip_prefix(".contact-")
+        .and_then(|r| r.strip_suffix(".pdf.part"))
+        .is_some_and(is_part_number)
+}
+
+fn is_part_number(n: &str) -> bool {
+    n.len() >= 2 && n.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn remove_files_matching(dir: &Path, matches: fn(&str) -> bool) -> Result<()> {
+    for entry in fs::read_dir(dir)?.filter_map(|e| e.ok()) {
+        if entry.file_name().to_str().is_some_and(matches) {
+            let path = entry.path();
+            fs::remove_file(&path).with_context(|| format!("cannot remove {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// A single PDF/X-4 file written object by object.
+///
+/// Each indirect object is built in its own `Chunk`, so its byte offset is the
+/// file position at which the chunk is written. Only these offsets stay in
+/// memory; the cross-reference stream at the end is built from them.
+struct PdfFile {
+    /// `None` once the file is closed.
+    out: Option<BufWriter<File>>,
+    path: PathBuf,
+    pos: u64,
+    offsets: Vec<(Ref, u64)>,
     next_id: i32,
     catalog_id: Ref,
     page_tree_id: Ref,
     srgb_id: Ref,
     page_ids: Vec<Ref>,
-    title: String,
     created: Timestamp,
-    intent: OutputIntent,
+    intent: Rc<OutputIntent>,
+    done: bool,
 }
 
-impl PdfSheets {
-    pub fn new(title: &str, intent: OutputIntent) -> Self {
-        let mut sheets = Self {
-            pdf: Pdf::new(),
+impl PdfFile {
+    fn create(path: PathBuf, intent: Rc<OutputIntent>) -> Result<Self> {
+        let file =
+            File::create(&path).with_context(|| format!("cannot create {}", path.display()))?;
+        let mut pdf = Self {
+            out: Some(BufWriter::new(file)),
+            path,
+            pos: 0,
+            offsets: Vec::new(),
             next_id: 1,
             catalog_id: Ref::new(1),
             page_tree_id: Ref::new(1),
             srgb_id: Ref::new(1),
             page_ids: Vec::new(),
-            title: title.to_string(),
             created: Timestamp::now(),
             intent,
+            done: false,
         };
-        // PDF/X-4 is based on PDF 1.6.
-        sheets.pdf.set_version(1, 6);
-        sheets.catalog_id = sheets.alloc();
-        sheets.page_tree_id = sheets.alloc();
-        sheets.srgb_id = sheets.alloc();
-        sheets
-            .pdf
-            .icc_profile(sheets.srgb_id, SRGB_ICC)
+        pdf.catalog_id = pdf.alloc();
+        pdf.page_tree_id = pdf.alloc();
+        pdf.srgb_id = pdf.alloc();
+
+        // PDF/X-4 is based on PDF 1.6; the second line marks the file as binary.
+        pdf.write_raw(b"%PDF-1.6\n%\x80\x80\x80\x80\n")?;
+        let mut chunk = Chunk::new();
+        chunk
+            .icc_profile(pdf.srgb_id, SRGB_ICC)
             .n(3)
             .alternate()
             .device_rgb();
-        sheets
+        pdf.write_object(&chunk)?;
+        Ok(pdf)
     }
 
     fn alloc(&mut self) -> Ref {
@@ -226,22 +398,49 @@ impl PdfSheets {
         id
     }
 
-    /// Adds a page of `size` (width, height in points) covered by `jpeg`, a
-    /// baseline RGB JPEG of `width`×`height` px.
-    pub fn add_page(&mut self, jpeg: &[u8], width: u32, height: u32, size: (f32, f32)) {
+    fn page_count(&self) -> usize {
+        self.page_ids.len()
+    }
+
+    /// Size of the file once finished: what is written so far, plus the
+    /// output profile and a margin for the closing objects.
+    fn projected_size(&self) -> u64 {
+        self.pos + self.intent.profile.len() as u64 + 64 * 1024
+    }
+
+    fn write_raw(&mut self, bytes: &[u8]) -> Result<()> {
+        let out = self.out.as_mut().expect("PDF file already closed");
+        out.write_all(bytes)
+            .with_context(|| format!("failed to write {}", self.path.display()))?;
+        self.pos += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Writes a chunk holding exactly one indirect object.
+    fn write_object(&mut self, chunk: &Chunk) -> Result<()> {
+        let mut refs = chunk.refs();
+        let id = refs.next().expect("chunk without an object");
+        debug_assert!(refs.next().is_none(), "chunk with more than one object");
+        self.offsets.push((id, self.pos));
+        self.write_raw(chunk.as_bytes())
+    }
+
+    fn add_page(&mut self, jpeg: &[u8], width: u32, height: u32, size: (f32, f32)) -> Result<()> {
         let page_id = self.alloc();
         let image_id = self.alloc();
         let content_id = self.alloc();
         let (w, h) = size;
         let page_box = Rect::new(0.0, 0.0, w, h);
 
-        let mut image = self.pdf.image_xobject(image_id, jpeg);
+        let mut chunk = Chunk::new();
+        let mut image = chunk.image_xobject(image_id, jpeg);
         image.filter(Filter::DctDecode);
         image.width(width as i32);
         image.height(height as i32);
         image.color_space().icc_based(self.srgb_id);
         image.bits_per_component(8);
         image.finish();
+        self.write_object(&chunk)?;
 
         let mut content = Content::new();
         content
@@ -249,38 +448,44 @@ impl PdfSheets {
             .transform([w, 0.0, 0.0, h, 0.0, 0.0])
             .x_object(Name(b"Im1"))
             .restore_state();
-        self.pdf.stream(content_id, &content.finish());
+        let mut chunk = Chunk::new();
+        chunk.stream(content_id, &content.finish());
+        self.write_object(&chunk)?;
 
-        let mut page = self.pdf.page(page_id);
+        let mut chunk = Chunk::new();
+        let mut page = chunk.page(page_id);
         page.parent(self.page_tree_id)
             .media_box(page_box)
             .trim_box(page_box)
             .contents(content_id);
         page.resources().x_objects().pair(Name(b"Im1"), image_id);
         page.finish();
+        self.write_object(&chunk)?;
+
         self.page_ids.push(page_id);
+        Ok(())
     }
 
-    pub fn page_count(&self) -> usize {
-        self.page_ids.len()
-    }
-
-    /// Writes the document structure and metadata and saves the file.
-    pub fn save(mut self, path: &Path) -> Result<()> {
+    /// Writes the document structure, metadata and cross-reference stream,
+    /// and closes the file.
+    fn close(&mut self, title: &str) -> Result<()> {
         let info_id = self.alloc();
         let metadata_id = self.alloc();
         let output_profile_id = self.alloc();
-        let document_id = self.created.document_id(&self.title);
+        let document_id = self.created.document_id(title);
 
-        self.pdf
+        let mut chunk = Chunk::new();
+        chunk
             .pages(self.page_tree_id)
             .kids(self.page_ids.iter().copied())
             .count(self.page_ids.len() as i32);
+        self.write_object(&chunk)?;
 
-        let intent = &self.intent;
         // Print shop profiles are often 1–2 MB and compress well.
+        let intent = Rc::clone(&self.intent);
         let compressed = miniz_oxide::deflate::compress_to_vec_zlib(&intent.profile, 6);
-        let mut profile = self.pdf.icc_profile(output_profile_id, &compressed);
+        let mut chunk = Chunk::new();
+        let mut profile = chunk.icc_profile(output_profile_id, &compressed);
         profile.filter(Filter::FlateDecode);
         profile.n(i32::from(intent.components));
         match intent.components {
@@ -289,27 +494,29 @@ impl PdfSheets {
             _ => profile.alternate().device_cmyk(),
         }
         profile.finish();
+        self.write_object(&chunk)?;
 
         let producer = format!("contact-sheet {}", env!("CARGO_PKG_VERSION"));
         let date = self.created.pdf_date();
-        self.pdf
-            .document_info(info_id)
-            .title(TextStr(&self.title))
+        let mut chunk = Chunk::new();
+        chunk
+            .indirect(info_id)
+            .start::<DocumentInfo>()
+            .title(TextStr(title))
             .creator(TextStr(&producer))
             .producer(TextStr(&producer))
             .creation_date(date)
             .modified_date(date)
             .trapped(TrappingStatus::NotTrapped);
+        self.write_object(&chunk)?;
 
-        let xmp = xmp_metadata(
-            &self.title,
-            &producer,
-            &self.created.iso8601(),
-            &document_id,
-        );
-        self.pdf.metadata(metadata_id, xmp.as_bytes());
+        let xmp = xmp_metadata(title, &producer, &self.created.iso8601(), &document_id);
+        let mut chunk = Chunk::new();
+        chunk.metadata(metadata_id, xmp.as_bytes());
+        self.write_object(&chunk)?;
 
-        let mut catalog = self.pdf.catalog(self.catalog_id);
+        let mut chunk = Chunk::new();
+        let mut catalog = chunk.indirect(self.catalog_id).start::<Catalog>();
         catalog.pages(self.page_tree_id).metadata(metadata_id);
         let mut intents = catalog.output_intents();
         let mut output_intent = intents.push();
@@ -327,11 +534,62 @@ impl PdfSheets {
         output_intent.finish();
         intents.finish();
         catalog.finish();
+        self.write_object(&chunk)?;
 
-        let id = document_id.as_bytes().to_vec();
-        self.pdf.set_file_id((id.clone(), id));
-        fs::write(path, self.pdf.finish())
-            .with_context(|| format!("failed to write {}", path.display()))
+        self.write_xref_stream(info_id, document_id.as_bytes())?;
+        let mut out = self.out.take().expect("PDF file already closed");
+        out.flush()
+            .with_context(|| format!("failed to write {}", self.path.display()))?;
+        self.done = true;
+        Ok(())
+    }
+
+    /// Writes the cross-reference stream (PDF 1.5+, allowed by PDF/X-4) and
+    /// the trailer. Unlike a classic xref table, whose offsets have 10 digits,
+    /// it works for files of any size.
+    fn write_xref_stream(&mut self, info_id: Ref, file_id: &[u8]) -> Result<()> {
+        const WIDTHS: [usize; 3] = [1, 8, 2];
+        let xref_id = self.alloc();
+        let xref_pos = self.pos;
+        self.offsets.push((xref_id, xref_pos));
+
+        // Entry per object number: type 1 (in use) with its offset, type 0 for
+        // object 0 and any unused number.
+        let size = self.next_id as usize;
+        let mut entries = vec![[0u8; 11]; size];
+        entries[0] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff];
+        for &(id, offset) in &self.offsets {
+            let entry = &mut entries[id.get() as usize];
+            entry[0] = 1;
+            entry[1..9].copy_from_slice(&offset.to_be_bytes());
+        }
+        let data = entries.concat();
+
+        let mut chunk = Chunk::new();
+        let mut xref = chunk.stream(xref_id, &data);
+        xref.pair(Name(b"Type"), Name(b"XRef"))
+            .pair(Name(b"Size"), size as i32)
+            .pair(Name(b"Root"), self.catalog_id)
+            .pair(Name(b"Info"), info_id);
+        xref.insert(Name(b"W"))
+            .array()
+            .items(WIDTHS.map(|w| w as i32));
+        xref.insert(Name(b"ID"))
+            .array()
+            .items([Str(file_id), Str(file_id)]);
+        xref.finish();
+        self.write_raw(chunk.as_bytes())?;
+        self.write_raw(format!("startxref\n{xref_pos}\n%%EOF\n").as_bytes())
+    }
+}
+
+impl Drop for PdfFile {
+    /// Removes the partial file of a run that failed or was cut short.
+    fn drop(&mut self) {
+        if !self.done {
+            drop(self.out.take());
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -460,6 +718,166 @@ impl Timestamp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const A4_PT: (f32, f32) = (595.2756, 841.8898);
+
+    fn tiny_jpeg() -> Vec<u8> {
+        use image::ImageEncoder;
+        let mut buf = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut buf)
+            .write_image(&[200; 8 * 8 * 3], 8, 8, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        buf
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("contact-sheet-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn find(data: &[u8], needle: &[u8], from: usize) -> usize {
+        from + data[from..]
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .unwrap_or_else(|| panic!("{:?} not found", String::from_utf8_lossy(needle)))
+    }
+
+    /// Checks the file structure and returns its page count: the trailer points
+    /// to the xref stream, and every entry in it points to its object.
+    fn check_pdf(path: &Path) -> usize {
+        let data = fs::read(path).unwrap();
+        assert!(data.starts_with(b"%PDF-1.6\n"));
+        assert!(data.ends_with(b"%%EOF\n"));
+
+        let start = find(&data, b"startxref\n", data.len() - 40) + b"startxref\n".len();
+        let end = find(&data, b"\n", start);
+        let xref_pos: usize = std::str::from_utf8(&data[start..end])
+            .unwrap()
+            .parse()
+            .unwrap();
+        let xref_header = &data[xref_pos..find(&data, b"\n", xref_pos)];
+        assert!(
+            xref_header.ends_with(b" 0 obj"),
+            "startxref points to an object"
+        );
+        let dict_end = find(&data, b"stream\n", xref_pos);
+        let dict = String::from_utf8_lossy(&data[xref_pos..dict_end]);
+        assert!(dict.contains("/Type /XRef"), "{dict}");
+        let size: usize = dict
+            .split("/Size ")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        let entries = &data[dict_end + b"stream\n".len()..][..size * 11];
+        let mut in_use = 0;
+        for (id, entry) in entries.as_chunks::<11>().0.iter().enumerate() {
+            if entry[0] == 1 {
+                let offset = u64::from_be_bytes(entry[1..9].try_into().unwrap()) as usize;
+                let header = format!("{id} 0 obj");
+                assert!(data[offset..].starts_with(header.as_bytes()), "object {id}");
+                in_use += 1;
+            }
+        }
+        assert_eq!(in_use, size - 1, "every object number is used");
+
+        let text = String::from_utf8_lossy(&data);
+        let count = text.split("/Count ").nth(1).unwrap();
+        count.split_whitespace().next().unwrap().parse().unwrap()
+    }
+
+    fn series(dir: &Path, max_pages: Option<usize>, max_bytes: u64) -> PdfSeries {
+        PdfSeries::new(dir, "Test", OutputIntent::fogra39(), max_pages, max_bytes).unwrap()
+    }
+
+    #[test]
+    fn single_file_is_named_contact_pdf() {
+        let dir = temp_dir("pdf-single");
+        fs::write(dir.join("contact-01.pdf"), b"old").unwrap();
+        fs::write(dir.join(".contact-01.pdf.part"), b"left by a killed run").unwrap();
+        let jpeg = tiny_jpeg();
+        let mut pdf = series(&dir, None, DEFAULT_MAX_PDF_BYTES);
+        for _ in 0..3 {
+            pdf.add_page(&jpeg, 8, 8, A4_PT).unwrap();
+        }
+        let saved = pdf.finish().unwrap();
+
+        assert_eq!(saved, [(dir.join("contact.pdf"), 3)]);
+        assert_eq!(names_in(&dir), ["contact.pdf"]);
+        assert_eq!(check_pdf(&dir.join("contact.pdf")), 3);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn output_is_split_by_page_count() {
+        let dir = temp_dir("pdf-pages");
+        fs::write(dir.join("contact.pdf"), b"old").unwrap();
+        let jpeg = tiny_jpeg();
+        let mut pdf = series(&dir, Some(2), DEFAULT_MAX_PDF_BYTES);
+        for _ in 0..5 {
+            pdf.add_page(&jpeg, 8, 8, A4_PT).unwrap();
+        }
+        let saved = pdf.finish().unwrap();
+
+        let pages: Vec<usize> = saved.iter().map(|(_, n)| *n).collect();
+        assert_eq!(pages, [2, 2, 1]);
+        assert_eq!(
+            names_in(&dir),
+            ["contact-01.pdf", "contact-02.pdf", "contact-03.pdf"]
+        );
+        for (path, pages) in &saved {
+            assert_eq!(check_pdf(path), *pages);
+        }
+        let first = fs::read(dir.join("contact-01.pdf")).unwrap();
+        assert!(String::from_utf8_lossy(&first).contains("Test, part 1"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn output_is_split_by_size() {
+        let dir = temp_dir("pdf-size");
+        let jpeg = vec![0u8; 100_000];
+        // Room for the output profile, the margin and two such pages.
+        let limit = FOGRA39_ICC.len() as u64 + 64 * 1024 + 250_000;
+        let mut pdf = series(&dir, None, limit);
+        for _ in 0..5 {
+            pdf.add_page(&jpeg, 8, 8, A4_PT).unwrap();
+        }
+        let saved = pdf.finish().unwrap();
+
+        let pages: Vec<usize> = saved.iter().map(|(_, n)| *n).collect();
+        assert_eq!(pages, [2, 2, 1]);
+        for (path, _) in &saved {
+            assert!(fs::metadata(path).unwrap().len() <= limit);
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unfinished_output_is_removed() {
+        let dir = temp_dir("pdf-drop");
+        let jpeg = tiny_jpeg();
+        let mut pdf = series(&dir, Some(1), DEFAULT_MAX_PDF_BYTES);
+        for _ in 0..3 {
+            pdf.add_page(&jpeg, 8, 8, A4_PT).unwrap();
+        }
+        drop(pdf);
+        assert!(names_in(&dir).is_empty(), "{:?}", names_in(&dir));
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn unix_time_converts_to_calendar_date() {
