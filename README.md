@@ -61,6 +61,16 @@ contact-sheet --paper letter ~/Pictures/2026-10-17
 
 ## Installation
 
+### With Homebrew (macOS and Linux)
+
+```
+brew install msetkowski/tap/contact-sheet
+```
+
+Homebrew installs the prebuilt binary for your Mac (Apple silicon or Intel) or Linux machine (x86_64 or ARM64) from the [msetkowski/tap](https://github.com/msetkowski/homebrew-tap) tap – nothing is compiled, and there is no Gatekeeper prompt. `brew upgrade contact-sheet` updates it; the formula follows each release automatically.
+
+### Download
+
 Download the archive for your platform from the [Releases](https://github.com/msetkowski/contact-sheet/releases) page:
 
 | Platform               | Archive                                                  |
