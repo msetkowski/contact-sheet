@@ -66,6 +66,7 @@ Download the archive for your platform from the [Releases](https://github.com/ms
 | Platform               | Archive                                                  |
 |------------------------|----------------------------------------------------------|
 | macOS (Apple silicon)  | `contact-sheet-vX.Y.Z-aarch64-apple-darwin.tar.gz`       |
+| macOS (Intel)          | `contact-sheet-vX.Y.Z-x86_64-apple-darwin.tar.gz`        |
 | Linux (x86_64, static) | `contact-sheet-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz`  |
 | Linux (ARM64, static)  | `contact-sheet-vX.Y.Z-aarch64-unknown-linux-musl.tar.gz` |
 | Windows (x86_64)       | `contact-sheet-vX.Y.Z-x86_64-pc-windows-msvc.zip`        |
@@ -86,7 +87,7 @@ With [cargo-binstall](https://github.com/cargo-bins/cargo-binstall), Cargo downl
 cargo binstall contact-sheet
 ```
 
-Or build it from [crates.io](https://crates.io/crates/contact-sheet) (Rust 1.89 or newer; this also works on platforms without a prebuilt binary, such as Intel Macs):
+Or build it from [crates.io](https://crates.io/crates/contact-sheet) (Rust 1.89 or newer; this also works on platforms without a prebuilt binary):
 
 ```
 cargo install contact-sheet
@@ -102,10 +103,14 @@ To build from a clone of the repository instead, see [Building](#building).
 contact-sheet [OPTIONS] <DIRECTORY>
 ```
 
-Sheets are written to `<DIRECTORY>/contact-sheet/` as `contact01.jpg`, `contact02.jpg`, … Sheets from a previous run (`contactNN.jpg`) are removed first. With `--format pdf` all pages go into `contact.pdf` instead, or into several files when the output is very large (see [Large output](#large-output)).
+Sheets are written to `<DIRECTORY>/contact-sheet/` as `contact01.jpg`, `contact02.jpg`, … With `--format pdf` all pages go into `contact.pdf` instead, or into several files when the output is very large (see [Large output](#large-output)). `--output-folder` and `--name` change the folder and the file names: `-o ~/Sheets -n wedding` writes `~/Sheets/wedding01.jpg` or `~/Sheets/wedding.pdf`.
+
+Sheets of a previous run with the same name are replaced; surplus pages it had (e.g. `contact07.jpg` when there are now only six pages) are removed. Only names exactly as the program writes them count as its output – with `-n IMG_`, `IMG_07.jpg` is a sheet but `IMG_0007.jpg` is not – so photos in the output folder are never overwritten or deleted, and earlier sheets are never read as photos.
 
 | Option | Default | What it does |
 |---|---|---|
+| `-o`, `--output-folder DIR` | `<DIRECTORY>/contact-sheet` | Folder for the sheets; created if needed. |
+| `-n`, `--name NAME` | `contact` | Base name of the output files: `NAME01.jpg`, … or `NAME.pdf`. |
 | `--recursive [DEPTH]` | off | Also scan subfolders; `--recursive 2` goes at most two levels down. Hidden folders and earlier `contact-sheet` output are skipped. |
 | `--only FORMAT,…` | all | Include only some formats: `raw` (all RAW formats and DNG), `jpg`, `tif`, or single extensions such as `cr3`. Several can be listed (`--only cr3,dng`); case does not matter. |
 | `--paper a4\|a3\|letter` | `a4` | Paper size. |
@@ -120,6 +125,7 @@ Sheets are written to `<DIRECTORY>/contact-sheet/` as `contact01.jpg`, `contact0
 | `--max-pdf-size MB` | `500` | Largest size of one PDF file before the output is split. |
 | `--max-pages N` | no limit | Largest number of pages in one PDF file. |
 | `-v`, `--verbose` | off | Print the name, file size, pixel dimensions and format of every file found. |
+| `--progress` | off | Print a line for every photo as it is processed: `[12/340] 2026-10-17/IMG_0001.CR2` – handy for progress bars in scripts and other programs. |
 
 How a sheet is laid out:
 
@@ -128,6 +134,14 @@ How a sheet is laid out:
 - row height adapts to the tallest thumbnail in the row; when the next row does not fit entirely on the page, a new page is started,
 - with `--only`, the program reports how many files the filter left out,
 - files that cannot be read are skipped with a warning.
+
+The run ends with a summary such as `Done: 118 photo(s) on 5 page(s), 2 file(s) skipped`. The exit status tells scripts how it went:
+
+| Exit status | Meaning |
+|---|---|
+| `0` | Every photo is on the sheets. |
+| `1` | Error, e.g. the folder cannot be read or no photo could be loaded; no sheets were written. |
+| `2` | The sheets were written, but some files could not be read and were skipped (each is listed on stderr). |
 
 ### PDF output
 
@@ -148,7 +162,7 @@ Pages are written to disk as soon as they are rendered, so memory use stays the 
 
 Very large PDFs open slowly or not at all in many viewers and print shop systems, so the output is split into several files rather than producing one unusable file (see `--max-pdf-size` and `--max-pages`). A single file is named `contact.pdf`; split output is named `contact-01.pdf`, `contact-02.pdf`, … and the document titles say which part each file is. After the first page the program estimates the total size and tells you when the output will be split; it also warns if you allow files over 1 GB.
 
-Files are written under temporary names and renamed only when all of them are complete. PDF output from an earlier run (`contact.pdf`, `contact-NN.pdf`) is replaced only then, so an interrupted run never leaves a broken PDF behind: the previous output stays intact, and a leftover hidden `.contact-NN.pdf.part` file is removed by the next run. JPEG sheets from earlier runs are left in place.
+Files are written under temporary names and renamed only when all of them are complete. PDF output from an earlier run (`contact.pdf`, `contact-NN.pdf`) is replaced only then, so an interrupted run never leaves a broken PDF behind: the previous output stays intact, and a leftover hidden `.contact-NN.pdf.part` file is removed by the next run. JPEG sheets from earlier runs are left in place. (With `--name`, these names use the chosen base name instead of `contact`.)
 
 ## Supported formats
 
@@ -163,6 +177,8 @@ Files are written under temporary names and renamed only when all of them are co
 | JPEG                                            | `.jpg`, `.jpeg`        | image                                     |
 
 For RAW files the embedded JPEG preview is used (fast). If it is missing or smaller than the thumbnail, the sensor data is developed by rawler.
+
+Large TIFF and JPEG files, such as high-resolution film scans of several GB, are supported. Images over 512 MiB once decoded are loaded one at a time and shrunk right away, so a folder full of them does not run out of memory; smaller files still load in parallel.
 
 Nikon *High Efficiency* NEF files (Z 8, Z 9 and similar) are shown using their embedded preview. rawler cannot decode their sensor data yet, so `--verbose` prints `?` instead of their pixel dimensions.
 
@@ -199,5 +215,7 @@ cargo build --release
 This project is licensed under the [Apache License, Version 2.0](LICENSE).
 
 The embedded font `assets/DejaVuSans.ttf` comes from the [DejaVu Fonts](https://dejavu-fonts.github.io/) project and is distributed under its own license (Bitstream Vera / Arev, DejaVu changes in the public domain); see [`assets/LICENSE-DejaVu.txt`](assets/LICENSE-DejaVu.txt).
+
+The binaries also contain the Rust libraries listed, with their licences, in [`THIRD-PARTY-LICENSES.txt`](THIRD-PARTY-LICENSES.txt), which is included in every release archive. Most are under permissive licences (MIT, Apache-2.0, BSD, Zlib); [rawler](https://github.com/dnglab/dnglab), which decodes the RAW files, is under the GNU LGPL 2.1 – the file says where to get its source code and how to build contact-sheet with a modified version. After changing dependencies, regenerate the file with `ruby scripts/third-party-licenses.rb`; the release workflow fails if it is out of date.
 
 The ICC profiles embedded in PDF output are in the public domain (CC0): `assets/sRGB-v2-magic.icc` from [Compact ICC Profiles](https://github.com/saucecontrol/Compact-ICC-Profiles) and `assets/FOGRA39L_coated.icc` from [colord](https://github.com/hughsie/colord) (generated with ArgyllCMS from the FOGRA39 characterization data).

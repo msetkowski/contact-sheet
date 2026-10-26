@@ -29,6 +29,11 @@ jobs:
             target: aarch64-unknown-linux-musl
           - os: macos-latest
             target: aarch64-apple-darwin
+          # Intel Macs: cross-compiled on the Apple silicon runner, where the
+          # x86_64 test binary cannot run natively, so tests are skipped.
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            skip-tests: true
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
@@ -48,7 +53,14 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Fails the release when dependencies changed but the licence notices
+      # shipped in the archives were not regenerated.
+      - name: Check third-party licence notices
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: ruby scripts/third-party-licenses.rb --check
+
       - name: Run tests
+        if: ${{ !matrix.skip-tests }}
         run: cargo test --release --locked --target ${{ matrix.target }}
 
       - name: Build
@@ -61,10 +73,11 @@ jobs:
           exe="${BIN}"
           [[ "${{ runner.os }}" == "Windows" ]] && exe="${BIN}.exe"
 
-          # The binary embeds the DejaVu font, whose license must accompany it.
+          # The licences of the embedded DejaVu font and of the crates built
+          # into the binary must accompany it.
           mkdir -p "dist/${name}"
           cp "target/${{ matrix.target }}/release/${exe}" README.md LICENSE "dist/${name}/"
-          cp assets/LICENSE-DejaVu.txt "dist/${name}/"
+          cp assets/LICENSE-DejaVu.txt THIRD-PARTY-LICENSES.txt "dist/${name}/"
 
           cd dist
           if [[ "${{ runner.os }}" == "Windows" ]]; then

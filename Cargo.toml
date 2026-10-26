@@ -1,12 +1,12 @@
 [package]
 name = "contact-sheet"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Create A4, A3 or Letter contact sheets (JPEG or PDF/X-4) from Canon, Nikon, Fujifilm and Hasselblad RAW, DNG, TIFF and JPEG photos"
 license = "Apache-2.0"
 repository = "https://github.com/msetkowski/contact-sheet"
-exclude = ["docs/", ".github/", ".gitignore"]
+exclude = ["docs/", ".github/", ".gitignore", "scripts/"]
 readme = "README.md"
 keywords = ["photography", "contact-sheet", "raw", "thumbnails", "cli"]
 categories = ["command-line-utilities", "multimedia::images"]

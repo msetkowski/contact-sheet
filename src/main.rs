@@ -1,16 +1,19 @@
 mod loader;
+mod output;
 mod pdf;
 mod sheet;
 
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use rayon::prelude::*;
 
 use loader::{SourceKind, lowercase_extension, source_kind};
+use output::OutputNames;
 use pdf::{DEFAULT_MAX_PDF_BYTES, OutputIntent, PdfSeries};
 use sheet::{Layout, Paginator, Palette, Paper, Renderer, Thumb, make_thumbnail};
 
@@ -26,11 +29,24 @@ const BATCH_ROWS: usize = 8;
 /// Fujifilm RAW (RAF), Hasselblad RAW (3FR, FFF), DNG, TIFF, JPEG.
 /// Output is written to the `contact-sheet` subdirectory as contact01.jpg, contact02.jpg, …
 /// or, with `--format pdf`, as a single PDF/X-4 file contact.pdf.
+///
+/// Exit status: 0 when every photo is on the sheets, 2 when some files could
+/// not be read and were skipped, 1 on errors.
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
     /// Directory containing the photos
     input: PathBuf,
+
+    /// Folder for the sheets, created if needed (default: the `contact-sheet`
+    /// subfolder of the photo directory)
+    #[arg(short, long, value_name = "DIR")]
+    output_folder: Option<PathBuf>,
+
+    /// Base name of the output files: NAME01.jpg, NAME02.jpg, … or NAME.pdf
+    #[arg(short, long, value_name = "NAME", default_value = output::DEFAULT_NAME,
+          value_parser = parse_output_name)]
+    name: OutputNames,
 
     /// Also scan subdirectories: all levels, or at most DEPTH levels down
     /// (e.g. `--recursive 2`). Hidden directories are skipped.
@@ -104,6 +120,10 @@ struct Args {
     /// Print the name, file size, pixel dimensions and format of every file found
     #[arg(short, long)]
     verbose: bool,
+
+    /// Print a line for every photo as it is processed: `[n/total] name`
+    #[arg(long)]
+    progress: bool,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,14 +180,22 @@ struct SourceFile {
     name: String,
 }
 
+/// Exit status when sheets were written but some files had to be skipped.
+const EXIT_SKIPPED: i32 = 2;
+
 fn main() {
-    if let Err(e) = run(Args::parse_from(normalize_args(std::env::args_os()))) {
-        eprintln!("Error: {e:#}");
-        std::process::exit(1);
+    match run(Args::parse_from(normalize_args(std::env::args_os()))) {
+        Ok(0) => {}
+        Ok(_skipped) => std::process::exit(EXIT_SKIPPED),
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            std::process::exit(1);
+        }
     }
 }
 
-fn run(args: Args) -> Result<()> {
+/// Creates the sheets; returns the number of files that could not be read.
+fn run(args: Args) -> Result<usize> {
     if !args.input.is_dir() {
         bail!("{} is not a directory", args.input.display());
     }
@@ -193,8 +221,15 @@ fn run(args: Args) -> Result<()> {
         None => Some(0),
         Some(depth) => depth,
     };
+    let out_dir = args
+        .output_folder
+        .clone()
+        .unwrap_or_else(|| args.input.join(OUTPUT_DIR));
+    // Sheets of an earlier run in the output folder are not photos.
+    let own_output = out_dir.canonicalize().ok().map(|dir| (dir, &args.name));
+
     let only = args.only.concat();
-    let (files, excluded) = collect_files(&args.input, max_depth, &only)?;
+    let (files, excluded) = collect_files(&args.input, max_depth, &only, own_output)?;
     if files.is_empty() && excluded > 0 {
         bail!(
             "no {} files found in {} ({excluded} file(s) in other formats left out by --only)",
@@ -230,22 +265,19 @@ fn run(args: Args) -> Result<()> {
     let renderer = Renderer::new(layout.clone(), args.background.palette())?;
     let columns = layout.columns as usize;
 
-    let out_dir = args.input.join(OUTPUT_DIR);
     fs::create_dir_all(&out_dir).with_context(|| format!("cannot create {}", out_dir.display()))?;
     let max_pdf_bytes = args
         .max_pdf_size
         .map_or(DEFAULT_MAX_PDF_BYTES, |mb| mb * 1_000_000);
     let mut pdf = match args.format {
-        Format::Jpg => {
-            remove_old_sheets(&out_dir)?;
-            None
-        }
+        Format::Jpg => None,
         Format::Pdf => {
             println!("PDF/X-4 output intent: {}", intent.name());
             let max_pages = args.max_pages.map(|n| n as usize);
             let title = pdf_title(&args.input);
             Some(PdfSeries::new(
                 &out_dir,
+                args.name.clone(),
                 &title,
                 intent,
                 max_pages,
@@ -279,7 +311,7 @@ fn run(args: Args) -> Result<()> {
                 println!("Rendered page {page_no} ({count} photo(s))");
             }
             None => {
-                let path = out_dir.join(format!("contact{page_no:02}.jpg"));
+                let path = out_dir.join(args.name.jpeg_page(page_no));
                 renderer.save_jpeg(&page, &path, args.quality)?;
                 println!("Saved {} ({count} photo(s))", path.display());
             }
@@ -287,24 +319,29 @@ fn run(args: Args) -> Result<()> {
         Ok(())
     };
 
+    let processed = AtomicUsize::new(0);
+    let load = |file: &SourceFile| {
+        let thumb = match loader::load(&file.path, file.kind, layout.cell) {
+            Ok(img) => Some(Thumb {
+                image: make_thumbnail(&img, layout.cell),
+                label: file.name.clone(),
+            }),
+            Err(e) => {
+                eprintln!("Skipped {}: {e:#}", file.name);
+                None
+            }
+        };
+        if args.progress {
+            let n = processed.fetch_add(1, Ordering::Relaxed) + 1;
+            println!("[{n}/{total_files}] {}", file.name);
+        }
+        thumb
+    };
+
     // Load in batches (in parallel within a batch) so we never keep
     // thumbnails of the whole directory in memory.
     for batch in files.chunks(columns * BATCH_ROWS) {
-        let thumbs: Vec<Thumb> = batch
-            .par_iter()
-            .filter_map(
-                |file| match loader::load(&file.path, file.kind, layout.cell) {
-                    Ok(img) => Some(Thumb {
-                        image: make_thumbnail(&img, layout.cell),
-                        label: file.name.clone(),
-                    }),
-                    Err(e) => {
-                        eprintln!("Skipped {}: {e:#}", file.name);
-                        None
-                    }
-                },
-            )
-            .collect();
+        let thumbs: Vec<Thumb> = batch.par_iter().filter_map(load).collect();
         failed += batch.len() - thumbs.len();
         pending.extend(thumbs);
 
@@ -327,20 +364,22 @@ fn run(args: Args) -> Result<()> {
     if page_no == 0 {
         bail!("could not load any photo");
     }
-    if let Some(pdf) = pdf {
-        let saved = pdf.finish()?;
-        for (path, pages) in &saved {
-            println!("Saved {} ({pages} page(s))", path.display());
+    let mut summary = format!("Done: {photos} photo(s) on {page_no} page(s)");
+    match pdf {
+        Some(pdf) => {
+            let saved = pdf.finish()?;
+            for (path, pages) in &saved {
+                println!("Saved {} ({pages} page(s))", path.display());
+            }
+            summary += &format!(" in {} PDF file(s)", saved.len());
         }
-        println!(
-            "{photos} photo(s) on {page_no} page(s) in {} PDF file(s)",
-            saved.len()
-        );
+        None => remove_old_sheets(&out_dir, &args.name, page_no)?,
     }
     if failed > 0 {
-        eprintln!("Failed to load {failed} file(s)");
+        summary += &format!(", {failed} file(s) skipped");
     }
-    Ok(())
+    println!("{summary}");
+    Ok(failed)
 }
 
 /// Tells up front how large the PDF output is going to be, extrapolated from
@@ -418,15 +457,23 @@ fn parse_format_filter(value: &str) -> Result<&'static [&'static str], String> {
 /// (`Some(0)`: `root` only, `None`: no limit). Hidden directories and output
 /// directories of earlier runs (`contact-sheet`) are skipped, as are symbolic
 /// links to directories, which could form loops.
+///
+/// `own_output` is the (canonical) output folder with the output names: JPEG
+/// sheets written there by an earlier run are not photos.
 fn collect_files(
     root: &Path,
     max_depth: Option<u32>,
     only: &[&str],
+    own_output: Option<(PathBuf, &OutputNames)>,
 ) -> Result<(Vec<SourceFile>, usize)> {
     let mut files = Vec::new();
     let mut excluded = 0;
     let mut dirs = vec![(root.to_path_buf(), 0)];
     while let Some((dir, depth)) = dirs.pop() {
+        let sheets_here = own_output
+            .as_ref()
+            .filter(|(out, _)| dir.canonicalize().is_ok_and(|d| d == *out))
+            .map(|(_, names)| *names);
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(e) if dir == root => {
@@ -450,6 +497,15 @@ fn collect_files(
             } else if path.is_file()
                 && let Some(kind) = source_kind(&path)
             {
+                let is_sheet = sheets_here.is_some_and(|names| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|f| names.jpeg_page_number(f).is_some())
+                });
+                if is_sheet {
+                    continue;
+                }
                 let wanted = only.is_empty()
                     || lowercase_extension(&path).is_some_and(|ext| only.contains(&ext.as_str()));
                 if !wanted {
@@ -524,20 +580,25 @@ fn is_hidden(path: &Path) -> bool {
         .is_some_and(|n| n.starts_with('.'))
 }
 
-/// Removes contact sheets from a previous run so no stale pages are left behind.
-fn remove_old_sheets(out_dir: &Path) -> Result<()> {
+/// Removes JPEG sheets left from a previous run that had more than `pages`
+/// pages; the others have just been overwritten.
+fn remove_old_sheets(out_dir: &Path, names: &OutputNames, pages: usize) -> Result<()> {
     for entry in fs::read_dir(out_dir)?.filter_map(|e| e.ok()) {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let is_sheet = name
-            .strip_prefix("contact")
-            .and_then(|r| r.strip_suffix(".jpg"))
-            .is_some_and(|n| n.len() >= 2 && n.bytes().all(|b| b.is_ascii_digit()));
-        if is_sheet {
-            fs::remove_file(entry.path())?;
+        let stale = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| names.jpeg_page_number(name))
+            .is_some_and(|n| n > pages);
+        if stale {
+            let path = entry.path();
+            fs::remove_file(&path).with_context(|| format!("cannot remove {}", path.display()))?;
         }
     }
     Ok(())
+}
+
+fn parse_output_name(value: &str) -> Result<OutputNames, String> {
+    OutputNames::new(value).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -631,7 +692,7 @@ mod tests {
             fs::write(root.join(file), b"").unwrap();
         }
         let names = |only: &[&str]| -> (Vec<String>, usize) {
-            let (files, excluded) = collect_files(&root, Some(0), only).unwrap();
+            let (files, excluded) = collect_files(&root, Some(0), only, None).unwrap();
             (files.into_iter().map(|f| f.name).collect(), excluded)
         };
 
@@ -666,7 +727,7 @@ mod tests {
             fs::write(path, b"").unwrap();
         }
         let names = |depth| -> Vec<String> {
-            let (files, _) = collect_files(&root, depth, &[]).unwrap();
+            let (files, _) = collect_files(&root, depth, &[], None).unwrap();
             files.into_iter().map(|f| f.name).collect()
         };
 
@@ -686,6 +747,110 @@ mod tests {
                 "b.jpg"
             ]
         );
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("contact-sheet-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_jpeg(path: &Path) {
+        image::RgbImage::from_pixel(60, 40, image::Rgb([120, 80, 40]))
+            .save(path)
+            .unwrap();
+    }
+
+    #[test]
+    fn output_options() {
+        let a = parse(&["photos"]).unwrap();
+        assert_eq!(a.output_folder, None);
+        assert_eq!(a.name.jpeg_page(1), "contact01.jpg");
+        assert!(!a.progress);
+
+        let a = parse(&["-o", "/tmp/out", "-n", "wedding", "--progress", "photos"]).unwrap();
+        assert_eq!(a.output_folder, Some(PathBuf::from("/tmp/out")));
+        assert_eq!(a.name.pdf_single(), "wedding.pdf");
+        assert!(a.progress);
+
+        let err = parse(&["--name", "a/b", "photos"]).unwrap_err().to_string();
+        assert!(err.contains("file name"), "{err}");
+    }
+
+    #[test]
+    fn own_sheets_in_the_output_folder_are_not_photos() {
+        let root = temp_dir("own-output");
+        for file in [
+            "IMG_0001.jpg",
+            "contact01.jpg",
+            "contact02.jpg",
+            "contact7.jpg",
+        ] {
+            fs::write(root.join(file), b"").unwrap();
+        }
+        let names = OutputNames::new("contact").unwrap();
+        let canonical = root.canonicalize().unwrap();
+        let (files, _) = collect_files(&root, Some(0), &[], Some((canonical, &names))).unwrap();
+        let (all, _) = collect_files(&root, Some(0), &[], None).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+
+        let files: Vec<String> = files.into_iter().map(|f| f.name).collect();
+        // `contact7.jpg` is not a name this program writes, so it is a photo.
+        assert_eq!(files, ["contact7.jpg", "IMG_0001.jpg"]);
+        assert_eq!(all.len(), 4);
+    }
+
+    #[test]
+    fn only_surplus_pages_of_an_earlier_run_are_removed() {
+        let dir = temp_dir("stale");
+        for file in [
+            "IMG_01.jpg",
+            "IMG_02.jpg",
+            "IMG_03.jpg",
+            "IMG_0004.jpg",
+            "IMG_7.jpg",
+            "x.jpg",
+        ] {
+            fs::write(dir.join(file), b"").unwrap();
+        }
+        remove_old_sheets(&dir, &OutputNames::new("IMG_").unwrap(), 1).unwrap();
+        let mut left: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(left, ["IMG_0004.jpg", "IMG_01.jpg", "IMG_7.jpg", "x.jpg"]);
+    }
+
+    #[test]
+    fn run_reports_skipped_files_and_writes_to_the_output_folder() {
+        let input = temp_dir("run-input");
+        let out = temp_dir("run-output").join("sheets");
+        write_jpeg(&input.join("a.jpg"));
+        write_jpeg(&input.join("b.jpg"));
+        fs::write(input.join("broken.jpg"), b"not a jpeg").unwrap();
+
+        let args = parse(&[
+            input.to_str().unwrap(),
+            "--output-folder",
+            out.to_str().unwrap(),
+            "--name",
+            "test",
+            "--dpi",
+            "72",
+        ])
+        .unwrap();
+        let skipped = run(args).unwrap();
+        let written = out.join("test01.jpg").is_file();
+        let default_dir = input.join(OUTPUT_DIR).exists();
+        fs::remove_dir_all(&input).unwrap();
+        fs::remove_dir_all(out.parent().unwrap()).unwrap();
+
+        assert_eq!(skipped, 1);
+        assert!(written, "sheet written to the output folder");
+        assert!(!default_dir, "no contact-sheet folder next to the photos");
     }
 
     #[test]

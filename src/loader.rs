@@ -2,6 +2,7 @@
 //! `DynamicImage`.
 
 use std::path::Path;
+use std::sync::Mutex;
 
 use anyhow::{Context, Result, anyhow, bail};
 use image::metadata::Orientation;
@@ -92,7 +93,7 @@ pub fn format_name(path: &Path) -> &'static str {
 pub fn load(path: &Path, kind: SourceKind, min_size: u32) -> Result<DynamicImage> {
     match kind {
         SourceKind::Raw => load_raw(path, min_size),
-        SourceKind::Image => load_image(path),
+        SourceKind::Image => load_image(path, min_size),
     }
 }
 
@@ -160,13 +161,31 @@ fn raw_orientation(
         .unwrap_or(Orientation::NoTransforms)
 }
 
-fn load_image(path: &Path) -> Result<DynamicImage> {
-    let mut decoder = ImageReader::open(path)?
-        .with_guessed_format()?
-        .into_decoder()
-        .context("cannot read image file")?;
+/// Decoded size above which images are decoded one at a time.
+const LARGE_IMAGE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Held while a large image is decoded. Photos load in parallel, and several
+/// film scans of a few GB each decoded at once could exhaust memory.
+static LARGE_IMAGE_DECODE: Mutex<()> = Mutex::new(());
+
+fn load_image(path: &Path, min_size: u32) -> Result<DynamicImage> {
+    let mut reader = ImageReader::open(path)?.with_guessed_format()?;
+    // The default 512 MiB limit rejects large film scans; memory use is
+    // bounded by decoding them one at a time instead.
+    reader.no_limits();
+    let mut decoder = reader.into_decoder().context("cannot read image file")?;
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let large = decoder.total_bytes() > LARGE_IMAGE_BYTES;
+    let guard = large.then(|| LARGE_IMAGE_DECODE.lock().unwrap_or_else(|e| e.into_inner()));
     let mut img = DynamicImage::from_decoder(decoder).context("failed to decode image")?;
+    if large {
+        // Shrink while still holding the lock, so only one full-size scan is
+        // in memory at a time. Twice the thumbnail size, as the thumbnail
+        // pre-shrink would do anyway – the result looks the same.
+        let side = min_size.saturating_mul(2).max(1);
+        img = img.thumbnail(side, side);
+    }
+    drop(guard);
     img.apply_orientation(orientation);
     Ok(img)
 }

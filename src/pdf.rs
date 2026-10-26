@@ -18,6 +18,8 @@ use pdf_writer::types::{OutputIntentSubtype, TrappingStatus};
 use pdf_writer::writers::{Catalog, DocumentInfo};
 use pdf_writer::{Chunk, Content, Date, Filter, Finish, Name, Rect, Ref, Str, TextStr};
 
+use crate::output::OutputNames;
+
 /// sRGB IEC 61966-2.1 (ICC v2, Compact ICC Profiles, CC0).
 const SRGB_ICC: &[u8] = include_bytes!("../assets/sRGB-v2-magic.icc");
 /// FOGRA39L Coated (ICC v2 output profile from colord, CC0).
@@ -195,9 +197,11 @@ pub const DEFAULT_MAX_PDF_BYTES: u64 = 500_000_000;
 ///
 /// Files are written under temporary names and renamed only once all of them
 /// are complete: `contact.pdf` for a single file, otherwise `contact-01.pdf`,
-/// `contact-02.pdf`, … An interrupted run leaves no partial PDF behind.
+/// `contact-02.pdf`, … (with the chosen base name). An interrupted run leaves
+/// no partial PDF behind.
 pub struct PdfSeries {
     dir: PathBuf,
+    names: OutputNames,
     title: String,
     intent: Rc<OutputIntent>,
     max_pages: Option<usize>,
@@ -210,14 +214,16 @@ pub struct PdfSeries {
 impl PdfSeries {
     pub fn new(
         dir: &Path,
+        names: OutputNames,
         title: &str,
         intent: OutputIntent,
         max_pages: Option<usize>,
         max_bytes: u64,
     ) -> Result<Self> {
-        remove_files_matching(dir, is_temp_name)?;
+        remove_files_matching(dir, |f| names.is_pdf_temp(f))?;
         Ok(Self {
             dir: dir.to_path_buf(),
+            names,
             title: title.to_string(),
             intent: Rc::new(intent),
             max_pages,
@@ -247,7 +253,7 @@ impl PdfSeries {
             Some(file) => file,
             None => {
                 let part = self.finished.len() + 1;
-                let path = self.dir.join(format!(".contact-{part:02}.pdf.part"));
+                let path = self.dir.join(self.names.pdf_temp(part));
                 self.current
                     .insert(PdfFile::create(path, Rc::clone(&self.intent))?)
             }
@@ -278,15 +284,15 @@ impl PdfSeries {
         let split = !self.finished.is_empty();
         self.close_current(split)?;
         let parts = std::mem::take(&mut self.finished);
-        remove_files_matching(&self.dir, is_output_name)?;
+        remove_files_matching(&self.dir, |f| self.names.is_pdf_output(f))?;
 
         let mut saved = Vec::with_capacity(parts.len());
         let count = parts.len();
         for (i, (temp, pages)) in parts.iter().enumerate() {
             let name = if count == 1 {
-                "contact.pdf".to_string()
+                self.names.pdf_single()
             } else {
-                format!("contact-{:02}.pdf", i + 1)
+                self.names.pdf_part(i + 1)
             };
             let path = self.dir.join(name);
             fs::rename(temp, &path).with_context(|| {
@@ -307,29 +313,9 @@ impl Drop for PdfSeries {
     }
 }
 
-/// `contact.pdf` or `contact-NN.pdf`: output of an earlier run.
-fn is_output_name(name: &str) -> bool {
-    name == "contact.pdf"
-        || name
-            .strip_prefix("contact-")
-            .and_then(|r| r.strip_suffix(".pdf"))
-            .is_some_and(is_part_number)
-}
-
-/// `.contact-NN.pdf.part`: a file being written, possibly left by a killed run.
-fn is_temp_name(name: &str) -> bool {
-    name.strip_prefix(".contact-")
-        .and_then(|r| r.strip_suffix(".pdf.part"))
-        .is_some_and(is_part_number)
-}
-
-fn is_part_number(n: &str) -> bool {
-    n.len() >= 2 && n.bytes().all(|b| b.is_ascii_digit())
-}
-
-fn remove_files_matching(dir: &Path, matches: fn(&str) -> bool) -> Result<()> {
+fn remove_files_matching(dir: &Path, matches: impl Fn(&str) -> bool) -> Result<()> {
     for entry in fs::read_dir(dir)?.filter_map(|e| e.ok()) {
-        if entry.file_name().to_str().is_some_and(matches) {
+        if entry.file_name().to_str().is_some_and(&matches) {
             let path = entry.path();
             fs::remove_file(&path).with_context(|| format!("cannot remove {}", path.display()))?;
         }
@@ -800,7 +786,15 @@ mod tests {
     }
 
     fn series(dir: &Path, max_pages: Option<usize>, max_bytes: u64) -> PdfSeries {
-        PdfSeries::new(dir, "Test", OutputIntent::fogra39(), max_pages, max_bytes).unwrap()
+        PdfSeries::new(
+            dir,
+            OutputNames::new(crate::output::DEFAULT_NAME).unwrap(),
+            "Test",
+            OutputIntent::fogra39(),
+            max_pages,
+            max_bytes,
+        )
+        .unwrap()
     }
 
     #[test]
