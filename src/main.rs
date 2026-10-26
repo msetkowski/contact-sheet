@@ -6,7 +6,7 @@ mod sheet;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
@@ -121,7 +121,8 @@ struct Args {
     #[arg(short, long)]
     verbose: bool,
 
-    /// Print a line for every photo as it is processed: `[n/total] name`
+    /// Print a line for every photo as it is processed:
+    /// `[n/total] ok name` or `[n/total] skipped name`
     #[arg(long)]
     progress: bool,
 }
@@ -188,10 +189,25 @@ fn main() {
         Ok(0) => {}
         Ok(_skipped) => std::process::exit(EXIT_SKIPPED),
         Err(e) => {
-            eprintln!("Error: {e:#}");
+            eprintln!("Error: {}", error_message(&e));
             std::process::exit(1);
         }
     }
+}
+
+/// The error with its causes, like `{:#}`, but without causes whose text an
+/// outer error already contains. The image crate, for one, includes the
+/// decoder's error in its own message and also returns it as the source,
+/// which would otherwise print it twice.
+fn error_message(error: &anyhow::Error) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for cause in error.chain() {
+        let text = cause.to_string();
+        if !parts.iter().any(|part| part.contains(&text)) {
+            parts.push(text);
+        }
+    }
+    parts.join(": ")
 }
 
 /// Creates the sheets; returns the number of files that could not be read.
@@ -319,7 +335,10 @@ fn run(args: Args) -> Result<usize> {
         Ok(())
     };
 
-    let processed = AtomicUsize::new(0);
+    // Number of photos processed so far. Counting and printing under one lock
+    // keeps the numbers in the progress lines in order, although photos
+    // finish in a different order on every run.
+    let processed = Mutex::new(0usize);
     let load = |file: &SourceFile| {
         let thumb = match loader::load(&file.path, file.kind, layout.cell) {
             Ok(img) => Some(Thumb {
@@ -327,13 +346,15 @@ fn run(args: Args) -> Result<usize> {
                 label: file.name.clone(),
             }),
             Err(e) => {
-                eprintln!("Skipped {}: {e:#}", file.name);
+                eprintln!("Skipped {}: {}", file.name, error_message(&e));
                 None
             }
         };
         if args.progress {
-            let n = processed.fetch_add(1, Ordering::Relaxed) + 1;
-            println!("[{n}/{total_files}] {}", file.name);
+            let mut n = processed.lock().unwrap_or_else(|e| e.into_inner());
+            *n += 1;
+            let status = if thumb.is_some() { "ok" } else { "skipped" };
+            println!("[{n}/{total_files}] {status} {}", file.name);
         }
         thumb
     };
@@ -851,6 +872,49 @@ mod tests {
         assert_eq!(skipped, 1);
         assert!(written, "sheet written to the output folder");
         assert!(!default_dir, "no contact-sheet folder next to the photos");
+    }
+
+    #[test]
+    fn repeated_causes_are_printed_once() {
+        use std::error::Error;
+        use std::fmt;
+
+        // Like image::ImageError: its message includes the decoder's error,
+        // which it also returns as its source.
+        #[derive(Debug)]
+        struct Decoder;
+        impl fmt::Display for Decoder {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("Illegal start bytes:6761")
+            }
+        }
+        impl Error for Decoder {}
+        #[derive(Debug)]
+        struct Wrapper(Decoder);
+        impl fmt::Display for Wrapper {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "Format error decoding Jpeg: {}", self.0)
+            }
+        }
+        impl Error for Wrapper {
+            fn source(&self) -> Option<&(dyn Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let error = anyhow::Error::new(Wrapper(Decoder)).context("cannot read image file");
+        assert_eq!(
+            format!("{error:#}"),
+            "cannot read image file: Format error decoding Jpeg: Illegal start bytes:6761: \
+             Illegal start bytes:6761"
+        );
+        assert_eq!(
+            error_message(&error),
+            "cannot read image file: Format error decoding Jpeg: Illegal start bytes:6761"
+        );
+        // Distinct causes are all kept.
+        let error = anyhow::anyhow!("disk full").context("failed to write a.pdf");
+        assert_eq!(error_message(&error), "failed to write a.pdf: disk full");
     }
 
     #[test]

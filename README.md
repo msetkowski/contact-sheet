@@ -121,21 +121,21 @@ Sheets of a previous run with the same name are replaced; surplus pages it had (
 |---|---|---|
 | `-o`, `--output-folder DIR` | `<DIRECTORY>/contact-sheet` | Folder for the sheets; created if needed. |
 | `-n`, `--name NAME` | `contact` | Base name of the output files: `NAME01.jpg`, … or `NAME.pdf`. |
-| `--recursive [DEPTH]` | off | Also scan subfolders; `--recursive 2` goes at most two levels down. Hidden folders and earlier `contact-sheet` output are skipped. |
+| `-r`, `--recursive [DEPTH]` | off | Also scan subfolders; `--recursive 2` goes at most two levels down. Hidden folders and earlier `contact-sheet` output are skipped. |
 | `--only FORMAT,…` | all | Include only some formats: `raw` (all RAW formats and DNG), `jpg`, `tif`, or single extensions such as `cr3`. Several can be listed (`--only cr3,dng`); case does not matter. |
-| `--paper a4\|a3\|letter` | `a4` | Paper size. |
-| `--landscape` | off | Landscape orientation. |
-| `--columns N` | `5` | Thumbnails per row. |
-| `--dpi N` | `300` | Resolution, at most 600 (300 DPI on A4 is 2480×3508 px; the density is stored in the JPEG). |
-| `--format jpg\|pdf` | `jpg` | JPEG pages, or one PDF/X-4 file (see [PDF output](#pdf-output)). |
-| `--quality N` | `90` | JPEG quality, also used for images inside the PDF. |
-| `--background white\|black` | `white` | `white` for printing, `black` for on-screen viewing (with white labels). |
+| `-p`, `--paper a4\|a3\|letter` | `a4` | Paper size. |
+| `-l`, `--landscape` | off | Landscape orientation. |
+| `-c`, `--columns N` | `5` | Thumbnails per row. |
+| `-d`, `--dpi N` | `300` | Resolution, at most 600 (300 DPI on A4 is 2480×3508 px; the density is stored in the JPEG). |
+| `-f`, `--format jpg\|pdf` | `jpg` | JPEG pages, or one PDF/X-4 file (see [PDF output](#pdf-output)). |
+| `-q`, `--quality N` | `90` | JPEG quality, also used for images inside the PDF. |
+| `-b`, `--background white\|black` | `white` | `white` for printing, `black` for on-screen viewing (with white labels). |
 | `--no-labels` | off | Leave out file names; rows move closer together, so more fit on a page. |
 | `--output-profile FILE.icc` | FOGRA39 | Output intent for PDF (see [PDF output](#pdf-output)). |
 | `--max-pdf-size MB` | `500` | Largest size of one PDF file before the output is split. |
 | `--max-pages N` | no limit | Largest number of pages in one PDF file. |
 | `-v`, `--verbose` | off | Print the name, file size, pixel dimensions and format of every file found. |
-| `--progress` | off | Print a line for every photo as it is processed: `[12/340] 2026-10-17/IMG_0001.CR2` – handy for progress bars in scripts and other programs. |
+| `--progress` | off | Print a line for every photo as it is processed: `[12/340] ok 2026-10-17/IMG_0001.CR2`, or `skipped` instead of `ok` for a file that could not be read – handy for progress bars in scripts and other programs. Photos are loaded in parallel, so the lines follow the order in which they finish, which varies between runs; the count always goes up by one. |
 
 How a sheet is laid out:
 

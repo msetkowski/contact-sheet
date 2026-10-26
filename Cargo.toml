@@ -1,6 +1,6 @@
 [package]
 name = "contact-sheet"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 rust-version = "1.89"
 description = "Create A4, A3 or Letter contact sheets (JPEG or PDF/X-4) from Canon, Nikon, Fujifilm and Hasselblad RAW, DNG, TIFF and JPEG photos"
