@@ -106,3 +106,26 @@ jobs:
           files: dist/*
           fail_on_unmatched_files: true
           generate_release_notes: true
+
+  # Runs after the GitHub release, so the archives `cargo binstall` downloads
+  # exist by the time the version appears on crates.io. Authenticates with
+  # crates.io Trusted Publishing (GitHub OIDC) – no API token is stored.
+  crates-io:
+    name: Publish to crates.io
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      - name: Publish
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
