@@ -89,7 +89,9 @@ BSD3_TEXT = <<~TEXT
 TEXT
 
 def run(*cmd)
-  out, err, status = Open3.capture3(*cmd, chdir: ROOT)
+  # Plain output to parse, even where CARGO_TERM_COLOR=always (as in CI).
+  env = { 'CARGO_TERM_COLOR' => 'never' }
+  out, err, status = Open3.capture3(env, *cmd, chdir: ROOT)
   abort("#{cmd.join(' ')} failed:\n#{err}") unless status.success?
   out
 end
