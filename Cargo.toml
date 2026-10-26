@@ -2,13 +2,25 @@
 name = "contact-sheet"
 version = "0.5.0"
 edition = "2024"
+rust-version = "1.89"
 description = "Create A4, A3 or Letter contact sheets (JPEG or PDF/X-4) from Canon, Nikon, Fujifilm and Hasselblad RAW, DNG, TIFF and JPEG photos"
 license = "Apache-2.0"
 repository = "https://github.com/msetkowski/contact-sheet"
-exclude = ["docs/"]
+exclude = ["docs/", ".github/", ".gitignore"]
 readme = "README.md"
 keywords = ["photography", "contact-sheet", "raw", "thumbnails", "cli"]
 categories = ["command-line-utilities", "multimedia::images"]
+
+# `cargo binstall contact-sheet` downloads the prebuilt binary from the GitHub
+# release instead of compiling. The archives are built by .github/workflows/release.yml.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.tar.gz"
+bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.zip"
+pkg-fmt = "zip"
 
 [dependencies]
 ab_glyph = "0.2.32"

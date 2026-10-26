@@ -78,15 +78,23 @@ The macOS binaries are not signed, so Gatekeeper blocks them on first run. To al
 xattr -d com.apple.quarantine contact-sheet
 ```
 
-<!-- After publishing to crates.io, add:
-With Rust installed:
+### With Cargo
+
+With [cargo-binstall](https://github.com/cargo-bins/cargo-binstall), Cargo downloads the prebuilt binary from the GitHub release for your platform – no compiling:
+
+```
+cargo binstall contact-sheet
+```
+
+Or build it from [crates.io](https://crates.io/crates/contact-sheet) (Rust 1.89 or newer; this also works on platforms without a prebuilt binary, such as Intel Macs):
 
 ```
 cargo install contact-sheet
 ```
--->
 
-To build from source instead, see [Building](#building).
+Both put `contact-sheet` into `~/.cargo/bin`, which is on your `PATH` after a standard Rust installation.
+
+To build from a clone of the repository instead, see [Building](#building).
 
 ## Usage
 
@@ -179,7 +187,7 @@ Digital photography got rid of negatives, but the need to see a whole session at
 
 ## Building
 
-Requires Rust (2024 edition). The project is pure Rust (no C libraries), so it builds the same way on macOS, Linux and Windows:
+Requires Rust 1.89 or newer. The project is pure Rust (no C libraries), so it builds the same way on macOS, Linux and Windows:
 
 ```
 cargo build --release
