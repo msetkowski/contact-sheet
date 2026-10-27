@@ -111,7 +111,8 @@ def packages
 end
 
 def holders(pkg)
-  authors = pkg['authors'].map { |a| a.sub(/\s*<.*>/, '') }
+  # The name before the "<email>", if any.
+  authors = pkg['authors'].map { |a| a[/\A[^<]*/].strip }
   authors.empty? ? "the #{pkg['name']} developers" : authors.join(', ')
 end
 
