@@ -409,6 +409,7 @@ version = "0.6.1"
 dependencies = [
  "ab_glyph",
  "anyhow",
+ "chrono",
  "clap",
  "image",
  "imageproc",

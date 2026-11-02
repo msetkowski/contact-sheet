@@ -53,6 +53,12 @@ Labels show the path relative to the scanned folder (e.g. `2026-10-17/IMG_0001.C
 contact-sheet --format pdf --output-profile PSOcoated_v3.icc ~/Pictures/2026-10-17
 ```
 
+**Sheets numbered and dated for the archive box**
+
+```
+contact-sheet --header "Roll 42" --header-align left --footer "{dd}.{mm}.{yyyy} – sheet {page}" --footer-align right ~/Scans/roll-042
+```
+
 **US Letter for a home printer**
 
 ```
@@ -131,6 +137,12 @@ Sheets of a previous run with the same name are replaced; surplus pages it had (
 | `-q`, `--quality N` | `90` | JPEG quality, also used for images inside the PDF. |
 | `-b`, `--background white\|black` | `white` | `white` for printing, `black` for on-screen viewing (with white labels). |
 | `--no-labels` | off | Leave out file names; rows move closer together, so more fit on a page. |
+| `--header TEXT` | none | Text in the top margin of every sheet (see [Header and footer](#header-and-footer)). |
+| `--header-align left\|center\|right` | `center` | Alignment of the header. |
+| `--header-size PT` | `5` | Font size of the header in points, 1 to 20. |
+| `--footer TEXT` | none | Text in the bottom margin of every sheet. |
+| `--footer-align left\|center\|right` | `center` | Alignment of the footer. |
+| `--footer-size PT` | `5` | Font size of the footer in points, 1 to 20. |
 | `--output-profile FILE.icc` | FOGRA39 | Output intent for PDF (see [PDF output](#pdf-output)). |
 | `--max-pdf-size MB` | `500` | Largest size of one PDF file before the output is split. |
 | `--max-pages N` | no limit | Largest number of pages in one PDF file. |
@@ -152,6 +164,21 @@ The run ends with a summary such as `Done: 118 photo(s) on 5 page(s), 2 file(s) 
 | `0` | Every photo is on the sheets. |
 | `1` | Error, e.g. the folder cannot be read or no photo could be loaded; no sheets were written. |
 | `2` | The sheets were written, but some files could not be read and were skipped (each is listed on stderr). |
+
+### Header and footer
+
+`--header` and `--footer` each take their own text and are aligned and sized independently with `--header-align`, `--footer-align`, `--header-size` and `--footer-size`. Both sit in the page margins, so they do not change how many photos fit on a page. By default they are set in 5 pt, smaller than the 7 pt labels; the largest size, 20 pt, still fits in the margin.
+
+These placeholders are replaced in the text; anything else in braces is printed as it is:
+
+| Placeholder | Replaced with |
+|---|---|
+| `{page}` | Sheet number; it keeps counting across split PDF files. |
+| `{dd}` | Current day, two digits. |
+| `{mm}` | Current month, two digits. |
+| `{yyyy}` | Current year. |
+
+The date is the computer's local date when the run starts. Text wider than the space between the side margins is shortened in the middle, like long file names, and the program prints a warning on stderr – once for the header and once for the footer, not for every sheet. The warning does not change the exit status.
 
 ### PDF output
 

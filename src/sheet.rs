@@ -2,10 +2,12 @@
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::ops::RangeInclusive;
 use std::path::Path;
 
-use ab_glyph::{FontRef, PxScale};
+use ab_glyph::{Font, FontRef, PxScale};
 use anyhow::{Context, Result};
+use chrono::{Datelike, NaiveDate};
 use image::codecs::jpeg::{JpegEncoder, PixelDensity};
 use image::imageops::{self, FilterType};
 use image::{DynamicImage, Rgb, RgbImage};
@@ -40,6 +42,12 @@ impl Palette {
 
 const MM_PER_INCH: f32 = 25.4;
 const POINTS_PER_INCH: f32 = 72.0;
+/// About 7 pt – legible in print while fitting typical file names.
+const LABEL_FONT_PT: f32 = 7.0;
+/// Default size of the header and footer, smaller than the labels.
+pub const DEFAULT_MARGIN_FONT_PT: f32 = 5.0;
+/// Sizes a header or footer can have; the largest still fits in the page margin.
+pub const MARGIN_FONT_PT_RANGE: RangeInclusive<f32> = 1.0..=20.0;
 
 /// Paper size in millimetres, portrait (width < height).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -94,8 +102,7 @@ impl Layout {
         let margin = mm(10.0);
         let gap = mm(3.0);
         let cell = (page_w - 2 * margin - (columns - 1) * gap) / columns;
-        // About 7 pt – legible in print while fitting typical file names.
-        let font_px = 7.0 / 72.0 * dpi as f32;
+        let font_px = LABEL_FONT_PT / POINTS_PER_INCH * dpi as f32;
         let label_h = (font_px * 1.8).ceil() as u32;
         Self {
             page_w,
@@ -198,6 +205,31 @@ pub fn make_thumbnail(img: &DynamicImage, cell: u32) -> RgbImage {
     pre.resize(cell, cell, FilterType::Lanczos3).to_rgb8()
 }
 
+/// The page margin a header or footer sits in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edge {
+    Top,
+    Bottom,
+}
+
+/// Horizontal position of a header or footer between the page margins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Align {
+    Left,
+    Center,
+    Right,
+}
+
+/// Replaces `{page}` with the sheet number and `{dd}`, `{mm}` and `{yyyy}` with
+/// the day, month and year of `date`. Other text in braces stays as it is.
+pub fn expand_placeholders(template: &str, page: usize, date: NaiveDate) -> String {
+    template
+        .replace("{page}", &page.to_string())
+        .replace("{dd}", &format!("{:02}", date.day()))
+        .replace("{mm}", &format!("{:02}", date.month()))
+        .replace("{yyyy}", &format!("{:04}", date.year()))
+}
+
 pub struct Renderer {
     layout: Layout,
     font: FontRef<'static>,
@@ -258,6 +290,54 @@ impl Renderer {
             y += img_h + l.label_h + l.gap;
         }
         page
+    }
+
+    /// Draws a line of text in the top or bottom margin of the page, in a font
+    /// of `font_pt` points, trimmed to the width between the side margins.
+    /// Returns the trimmed text if the original did not fit.
+    pub fn draw_margin_text(
+        &self,
+        page: &mut RgbImage,
+        edge: Edge,
+        align: Align,
+        font_pt: f32,
+        text: &str,
+    ) -> Option<String> {
+        let l = &self.layout;
+        let scale = self.scale_for_points(font_pt);
+        let shown = fit_text(text, l.page_w - 2 * l.margin, scale, &self.font);
+        let (w, _) = text_size(scale, &self.font, &shown);
+        let x = match align {
+            Align::Left => l.margin,
+            Align::Center => l.page_w.saturating_sub(w) / 2,
+            Align::Right => (l.page_w - l.margin).saturating_sub(w),
+        };
+        let centred = l.margin.saturating_sub(scale.y as u32) / 2;
+        let y = match edge {
+            Edge::Top => centred,
+            Edge::Bottom => l.page_h - l.margin + centred,
+        };
+        draw_text_mut(
+            page,
+            self.palette.text,
+            x as i32,
+            y as i32,
+            scale,
+            &self.font,
+            &shown,
+        );
+        (shown != text).then_some(shown)
+    }
+
+    /// The scale for a real font size in points: a `PxScale` is the height of
+    /// a whole line, which is more than the font size.
+    fn scale_for_points(&self, font_pt: f32) -> PxScale {
+        let em_px = font_pt / POINTS_PER_INCH * self.layout.dpi as f32;
+        let line_per_em = self
+            .font
+            .units_per_em()
+            .map_or(1.0, |units| self.font.height_unscaled() / units);
+        PxScale::from(em_px * line_per_em)
     }
 
     pub fn save_jpeg(&self, page: &RgbImage, path: &Path, quality: u8) -> Result<()> {
@@ -408,6 +488,134 @@ mod tests {
             rows += 1;
         }
         assert!(rows > (l.content_h() + l.gap) / (l.cell + l.label_h + l.gap));
+    }
+
+    /// First and last column and row where the page differs from the background.
+    fn ink_bounds(page: &RgbImage) -> Option<(u32, u32, u32, u32)> {
+        let ink: Vec<(u32, u32)> = page
+            .enumerate_pixels()
+            .filter(|(_, _, p)| **p != Palette::WHITE.background)
+            .map(|(x, y, _)| (x, y))
+            .collect();
+        let xs = ink.iter().map(|p| p.0);
+        let ys = ink.iter().map(|p| p.1);
+        Some((xs.clone().min()?, xs.max()?, ys.clone().min()?, ys.max()?))
+    }
+
+    fn margin_text_bounds(edge: Edge, align: Align, text: &str) -> (u32, u32, u32, u32) {
+        let l = Layout::new(Paper::A4, 150, 5, false);
+        let renderer = Renderer::new(l.clone(), Palette::WHITE).unwrap();
+        let mut page = RgbImage::from_pixel(l.page_w, l.page_h, Palette::WHITE.background);
+        renderer.draw_margin_text(&mut page, edge, align, DEFAULT_MARGIN_FONT_PT, text);
+        ink_bounds(&page).expect("text was drawn")
+    }
+
+    #[test]
+    fn margin_text_follows_the_font_size() {
+        let l = Layout::new(Paper::A4, 300, 5, false);
+        let renderer = Renderer::new(l.clone(), Palette::WHITE).unwrap();
+        let height = |font_pt| {
+            let mut page = RgbImage::from_pixel(l.page_w, l.page_h, Palette::WHITE.background);
+            renderer.draw_margin_text(&mut page, Edge::Top, Align::Left, font_pt, "H");
+            let (.., top, bottom) = ink_bounds(&page).unwrap();
+            bottom - top + 1
+        };
+        // The capital H of DejaVu Sans is 0.73 em high.
+        let expected = |font_pt: f32| font_pt / POINTS_PER_INCH * 300.0 * 0.73;
+        assert!((height(5.0) as f32 - expected(5.0)).abs() < 2.0);
+        assert!((height(12.5) as f32 - expected(12.5)).abs() < 2.0);
+    }
+
+    #[test]
+    fn largest_margin_text_fits_in_the_margin() {
+        for dpi in [72, 300, 600] {
+            let l = Layout::new(Paper::A4, dpi, 5, false);
+            let renderer = Renderer::new(l.clone(), Palette::WHITE).unwrap();
+            let font_pt = *MARGIN_FONT_PT_RANGE.end();
+            let tall = "ÁÉgjpq|";
+
+            let mut page = RgbImage::from_pixel(l.page_w, l.page_h, Palette::WHITE.background);
+            renderer.draw_margin_text(&mut page, Edge::Top, Align::Left, font_pt, tall);
+            let (.., bottom) = ink_bounds(&page).unwrap();
+            assert!(bottom < l.margin - 1, "{dpi} DPI, top: {bottom}");
+
+            let mut page = RgbImage::from_pixel(l.page_w, l.page_h, Palette::WHITE.background);
+            renderer.draw_margin_text(&mut page, Edge::Bottom, Align::Left, font_pt, tall);
+            let (.., top, bottom) = ink_bounds(&page).unwrap();
+            assert!(
+                top > l.page_h - l.margin && bottom < l.page_h,
+                "{dpi} DPI, bottom: {top}..{bottom}"
+            );
+        }
+    }
+
+    #[test]
+    fn margin_text_is_aligned_between_the_side_margins() {
+        let l = Layout::new(Paper::A4, 150, 5, false);
+        let bounds = |align| margin_text_bounds(Edge::Top, align, "Roll 42");
+
+        let (left, ..) = bounds(Align::Left);
+        assert!(left >= l.margin && left < l.margin + 5, "{left}");
+
+        let (_, right, ..) = bounds(Align::Right);
+        let end = l.page_w - l.margin;
+        assert!(right < end && right + 5 >= end, "{right}");
+
+        let (start, stop, ..) = bounds(Align::Center);
+        let middle = (start + stop) / 2;
+        assert!(middle.abs_diff(l.page_w / 2) <= 2, "{middle}");
+    }
+
+    #[test]
+    fn margin_text_stays_inside_its_margin() {
+        let l = Layout::new(Paper::A4, 150, 5, false);
+
+        let (.., top, bottom) = margin_text_bounds(Edge::Top, Align::Left, "Roll 42");
+        assert!(top > 0 && bottom < l.margin, "{top}..{bottom}");
+
+        let (.., top, bottom) = margin_text_bounds(Edge::Bottom, Align::Left, "Roll 42");
+        assert!(
+            top >= l.page_h - l.margin && bottom < l.page_h - 1,
+            "{top}..{bottom}"
+        );
+    }
+
+    #[test]
+    fn margin_text_too_wide_for_the_page_is_trimmed() {
+        let l = Layout::new(Paper::A4, 150, 5, false);
+        let renderer = Renderer::new(l.clone(), Palette::WHITE).unwrap();
+        let mut page = RgbImage::from_pixel(l.page_w, l.page_h, Palette::WHITE.background);
+
+        let short = renderer.draw_margin_text(&mut page, Edge::Top, Align::Left, 5.0, "Roll 42");
+        assert_eq!(short, None);
+
+        let long = format!("{} page 7", "very long header text ".repeat(40));
+        let trimmed = renderer
+            .draw_margin_text(&mut page, Edge::Bottom, Align::Right, 5.0, &long)
+            .expect("reported as trimmed");
+        assert!(
+            trimmed.contains('…') && trimmed.ends_with("page 7"),
+            "{trimmed}"
+        );
+
+        let (left, right, ..) = ink_bounds(&page).unwrap();
+        assert!(
+            left >= l.margin && right < l.page_w - l.margin,
+            "{left}..{right}"
+        );
+    }
+
+    #[test]
+    fn placeholders_are_replaced() {
+        let date = NaiveDate::from_ymd_opt(2026, 3, 9).unwrap();
+        assert_eq!(
+            expand_placeholders("{dd}.{mm}.{yyyy} – sheet {page}, {page}", 12, date),
+            "09.03.2026 – sheet 12, 12"
+        );
+        assert_eq!(
+            expand_placeholders("{PAGE} {other} {", 1, date),
+            "{PAGE} {other} {"
+        );
     }
 
     #[test]

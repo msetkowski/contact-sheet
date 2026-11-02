@@ -9,13 +9,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
+use chrono::Local;
 use clap::{Parser, ValueEnum};
 use rayon::prelude::*;
 
 use loader::{SourceKind, lowercase_extension, source_kind};
 use output::OutputNames;
 use pdf::{DEFAULT_MAX_PDF_BYTES, OutputIntent, PdfSeries};
-use sheet::{Layout, Paginator, Palette, Paper, Renderer, Thumb, make_thumbnail};
+use sheet::{
+    Align, DEFAULT_MARGIN_FONT_PT, Edge, Layout, MARGIN_FONT_PT_RANGE, Paginator, Palette, Paper,
+    Renderer, Thumb, expand_placeholders, make_thumbnail,
+};
 
 const OUTPUT_DIR: &str = "contact-sheet";
 /// PDF files above this size get a warning, whatever --max-pdf-size allows.
@@ -117,6 +121,35 @@ struct Args {
     #[arg(long)]
     no_labels: bool,
 
+    /// Text in the top margin of every sheet. {page} stands for the sheet
+    /// number, {dd}, {mm} and {yyyy} for today's day, month and year.
+    /// Text too wide for the page is trimmed, with a warning.
+    #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
+    header: Option<String>,
+
+    /// Alignment of the header
+    #[arg(long, value_enum, default_value_t = TextAlign::Center, requires = "header")]
+    header_align: TextAlign,
+
+    /// Font size of the header in points (1–20)
+    #[arg(long, value_name = "PT", default_value_t = DEFAULT_MARGIN_FONT_PT,
+          value_parser = parse_font_size, requires = "header")]
+    header_size: f32,
+
+    /// Text in the bottom margin of every sheet, with the same placeholders
+    /// as --header
+    #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
+    footer: Option<String>,
+
+    /// Alignment of the footer
+    #[arg(long, value_enum, default_value_t = TextAlign::Center, requires = "footer")]
+    footer_align: TextAlign,
+
+    /// Font size of the footer in points (1–20)
+    #[arg(long, value_name = "PT", default_value_t = DEFAULT_MARGIN_FONT_PT,
+          value_parser = parse_font_size, requires = "footer")]
+    footer_size: f32,
+
     /// Print the name, file size, pixel dimensions and format of every file found
     #[arg(short, long)]
     verbose: bool,
@@ -170,6 +203,54 @@ impl Background {
             Background::White => Palette::WHITE,
             Background::Black => Palette::BLACK,
         }
+    }
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum TextAlign {
+    Left,
+    Center,
+    Right,
+}
+
+impl TextAlign {
+    fn align(self) -> Align {
+        match self {
+            TextAlign::Left => Align::Left,
+            TextAlign::Center => Align::Center,
+            TextAlign::Right => Align::Right,
+        }
+    }
+}
+
+/// A header or footer, as given on the command line.
+struct MarginText {
+    /// How messages call it: "header" or "footer".
+    name: &'static str,
+    edge: Edge,
+    align: Align,
+    font_pt: f32,
+    template: String,
+    /// Whether trimming was already reported, to warn once and not on every page.
+    warned: bool,
+}
+
+impl MarginText {
+    fn new(
+        name: &'static str,
+        edge: Edge,
+        align: TextAlign,
+        font_pt: f32,
+        template: Option<&str>,
+    ) -> Option<Self> {
+        template.filter(|t| !t.is_empty()).map(|t| Self {
+            name,
+            edge,
+            align: align.align(),
+            font_pt,
+            template: t.to_string(),
+            warned: false,
+        })
     }
 }
 
@@ -302,6 +383,28 @@ fn run(args: Args) -> Result<usize> {
         }
     };
 
+    let mut margin_texts: Vec<MarginText> = [
+        MarginText::new(
+            "header",
+            Edge::Top,
+            args.header_align,
+            args.header_size,
+            args.header.as_deref(),
+        ),
+        MarginText::new(
+            "footer",
+            Edge::Bottom,
+            args.footer_align,
+            args.footer_size,
+            args.footer.as_deref(),
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    // Taken once, so a run past midnight does not change the date between sheets.
+    let today = Local::now().date_naive();
+
     let mut paginator = Paginator::new(layout.clone());
     let mut pending: Vec<Thumb> = Vec::new();
     let mut page_no = 0;
@@ -310,7 +413,27 @@ fn run(args: Args) -> Result<usize> {
     let total_files = files.len();
     let mut write_page = |rows: Vec<Vec<Thumb>>| -> Result<()> {
         page_no += 1;
-        let page = renderer.render_page(&rows);
+        let mut page = renderer.render_page(&rows);
+        for text in &mut margin_texts {
+            let expanded = expand_placeholders(&text.template, page_no, today);
+            let trimmed = renderer.draw_margin_text(
+                &mut page,
+                text.edge,
+                text.align,
+                text.font_pt,
+                &expanded,
+            );
+            if let Some(trimmed) = trimmed
+                && !text.warned
+            {
+                text.warned = true;
+                eprintln!(
+                    "Warning: the {} is too wide for the page and was trimmed, first on sheet \
+                     {page_no}: {trimmed}",
+                    text.name
+                );
+            }
+        }
         let count: usize = rows.iter().map(Vec::len).sum();
         photos += count;
         match &mut pdf {
@@ -618,6 +741,20 @@ fn remove_old_sheets(out_dir: &Path, names: &OutputNames, pages: usize) -> Resul
     Ok(())
 }
 
+fn parse_font_size(value: &str) -> Result<f32, String> {
+    value
+        .parse()
+        .ok()
+        .filter(|size| MARGIN_FONT_PT_RANGE.contains(size))
+        .ok_or_else(|| {
+            format!(
+                "must be a number from {} to {}",
+                MARGIN_FONT_PT_RANGE.start(),
+                MARGIN_FONT_PT_RANGE.end()
+            )
+        })
+}
+
 fn parse_output_name(value: &str) -> Result<OutputNames, String> {
     OutputNames::new(value).map_err(|e| e.to_string())
 }
@@ -797,6 +934,67 @@ mod tests {
 
         let err = parse(&["--name", "a/b", "photos"]).unwrap_err().to_string();
         assert!(err.contains("file name"), "{err}");
+    }
+
+    #[test]
+    fn header_and_footer_options() {
+        let a = parse(&["photos"]).unwrap();
+        assert_eq!((a.header, a.footer), (None, None));
+        assert_eq!(a.header_align, TextAlign::Center);
+        assert_eq!(a.footer_align, TextAlign::Center);
+        assert_eq!(a.header_size, DEFAULT_MARGIN_FONT_PT);
+        assert_eq!(a.footer_size, DEFAULT_MARGIN_FONT_PT);
+
+        let a = parse(&[
+            "--header",
+            "Roll 42",
+            "--header-align",
+            "left",
+            "--footer",
+            "-- {page} --",
+            "--footer-align",
+            "right",
+            "photos",
+        ])
+        .unwrap();
+        assert_eq!(a.header.as_deref(), Some("Roll 42"));
+        assert_eq!(a.header_align, TextAlign::Left);
+        assert_eq!(a.footer.as_deref(), Some("-- {page} --"));
+        assert_eq!(a.footer_align, TextAlign::Right);
+
+        let a = parse(&[
+            "--header",
+            "a",
+            "--header-size",
+            "9",
+            "--footer",
+            "b",
+            "--footer-size",
+            "6.5",
+            "photos",
+        ])
+        .unwrap();
+        assert_eq!((a.header_size, a.footer_size), (9.0, 6.5));
+
+        for size in ["0.5", "20.5", "-3", "big", "NaN", "inf"] {
+            let err = parse(&["--header", "a", "--header-size", size, "photos"]);
+            assert!(err.is_err(), "{size}");
+        }
+        // A size needs its own text, too.
+        assert!(parse(&["--header-size", "9", "photos"]).is_err());
+        assert!(parse(&["--header", "a", "--footer-size", "9", "photos"]).is_err());
+
+        // An alignment needs its own text, not just any text.
+        assert!(parse(&["--header-align", "left", "photos"]).is_err());
+        assert!(parse(&["--header", "a", "--footer-align", "left", "photos"]).is_err());
+        assert!(parse(&["--header", "a", "--header-align", "middle", "photos"]).is_err());
+    }
+
+    #[test]
+    fn empty_margin_text_is_left_out() {
+        assert!(MarginText::new("header", Edge::Top, TextAlign::Left, 5.0, Some("")).is_none());
+        assert!(MarginText::new("header", Edge::Top, TextAlign::Left, 5.0, None).is_none());
+        assert!(MarginText::new("header", Edge::Top, TextAlign::Left, 5.0, Some("a")).is_some());
     }
 
     #[test]
