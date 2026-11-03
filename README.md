@@ -162,7 +162,7 @@ The run ends with a summary such as `Done: 118 photo(s) on 5 page(s), 2 file(s) 
 | Exit status | Meaning |
 |---|---|
 | `0` | Every photo is on the sheets. |
-| `1` | Error, e.g. the folder cannot be read or no photo could be loaded; no sheets were written. |
+| `1` | Error, e.g. an invalid option, the folder cannot be read or no photo could be loaded; no sheets were written. |
 | `2` | The sheets were written, but some files could not be read and were skipped (each is listed on stderr). |
 
 ### Header and footer

@@ -35,7 +35,7 @@ const BATCH_ROWS: usize = 8;
 /// or, with `--format pdf`, as a single PDF/X-4 file contact.pdf.
 ///
 /// Exit status: 0 when every photo is on the sheets, 2 when some files could
-/// not be read and were skipped, 1 on errors.
+/// not be read and were skipped, 1 on errors (including invalid options).
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
@@ -265,13 +265,26 @@ struct SourceFile {
 /// Exit status when sheets were written but some files had to be skipped.
 const EXIT_SKIPPED: i32 = 2;
 
+/// Exit status on errors, including invalid command-line options.
+const EXIT_ERROR: i32 = 1;
+
 fn main() {
-    match run(Args::parse_from(normalize_args(std::env::args_os()))) {
+    // Not `Args::parse_from`: clap exits with 2 on invalid options, which
+    // scripts would read as EXIT_SKIPPED although nothing was written.
+    let args = match Args::try_parse_from(normalize_args(std::env::args_os())) {
+        Ok(args) => args,
+        Err(e) => {
+            // --help and --version also arrive here; they go to stdout and succeed.
+            let _ = e.print();
+            std::process::exit(if e.use_stderr() { EXIT_ERROR } else { 0 });
+        }
+    };
+    match run(args) {
         Ok(0) => {}
         Ok(_skipped) => std::process::exit(EXIT_SKIPPED),
         Err(e) => {
             eprintln!("Error: {}", error_message(&e));
-            std::process::exit(1);
+            std::process::exit(EXIT_ERROR);
         }
     }
 }
